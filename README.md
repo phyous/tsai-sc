@@ -35,6 +35,9 @@ the game's result screen can appear.
 Boot Camp remains available as an optional economy/input-adapter test mission.
 The default run target is Strongarm.
 
+[Development notes](docs/development-notes.md) document failed attempts,
+verified input defects, and the strategy changes being tested.
+
 ## Run it
 
 Requires Python 3.11+, Git, Node/npm, Chrome with WebGPU, and FFmpeg. Setup installs
