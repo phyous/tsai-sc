@@ -1,7 +1,7 @@
 # Lessons from developing the harness
 
-These notes describe failed Strongarm attempts and the changes made before
-attempt 10. They do not establish a combat victory or a measured improvement in
+These notes describe failed Strongarm attempts through attempt 10 and subsequent
+changes and probes. They do not establish a combat victory or a measured improvement in
 win rate. Code checks, controlled game tests, and strategy hypotheses provide
 different kinds of evidence.
 
@@ -90,3 +90,62 @@ different kinds of evidence.
    victory text automatically. See the [recorder](../tsai_sc/run.py),
    [capture tests](../tests/test_run_capture.py), and
    [evidence verifier](../tsai_sc/verify.py).
+
+9. **Assembly can become a repeated subgoal after it is already achieved.**
+   Attempt 10 was stopped after 110 decisions and about 670 seconds, with 34
+   living combat units at the last decision and no victory. Jev selected 67
+   regroup commands and 10 exploration commands. At call 46, twelve Marines
+   already formed a compact group with a maximum radius of 58 pixels, yet Jev
+   chose to send them back to the Command Center, 520 pixels from their center.
+   Earlier regroup choices moved coherent squads only 21–40 pixels toward the
+   global army center. Total army size and maximum spread did not clearly tell
+   the model that assembly was complete. The adapter refused 31 commands when
+   it could not select the exact requested surviving squad; **zero issued
+   tactical commands selected only part of that squad**. Refused commands and
+   unproductive model choices are separate failure modes.
+
+   The revised observation measures each selectable squad's largest core
+   within 192 pixels of an actual member, reports its exact members and Marine
+   count, and identifies cores of at least eight combat units. This is a
+   formation heuristic, not a guarantee of combat strength or a passable route.
+   Labels include current squad size because names can change as reinforcements
+   arrive. Returning an already formed force to base is described as a
+   withdrawal. The guidance allows that force to advance while income,
+   replacements, and smaller reinforcement groups continue independently.
+   Every retreat, regroup, exploration, and other existing command remains
+   available; there is no forced action or probability override.
+
+   Three real API probes reused frozen states from attempt 10 with the revised
+   observations and guidance. No probe issued game input:
+
+   | Source call | Original choice | Probe choice | Explore probability | Reposition probability |
+   | --- | --- | --- | --- | --- |
+   | 46 | Alpha: regroup at friendly base | Alpha: scout east | 0.70 | 0.00 |
+   | 71 | Alpha: regroup with friendly force | Bravo: scout east | 0.74 | 0.03 |
+   | 110 | Alpha: regroup at friendly base | Charlie: scout east | 0.67 | 0.01 |
+
+   These are separate intent-node probabilities, not joint command odds or win
+   predictions. The probes show a targeted choice change in three recorded
+   states; they do not demonstrate sustained play, victory, or an improved win
+   rate. See [formation and prompt code](../tsai_sc/combat.py) and
+   [formed/scattered squad tests](../tests/test_combat.py).
+
+10. **A pathfinding detour can initially look like movement away from the goal.**
+    At attempt 10 call 77, twelve exactly selected Marines received an eastward
+    attack-move toward (1388, 497). Tracking those same IDs and generations,
+    their center moved from (1004, 497) at frame 7483 to (843, 474) at frame
+    7629, then (767, 473) at frame 7701, before reaching (1315, 465) at frame
+    8288. They first traveled west while retaining their attack-move orders.
+    Increasing straight-line distance or temporary formation spread therefore
+    cannot alone establish blockage. Guidance now explicitly allows detours;
+    the current-order summary distinguishes attack-move, guard, and proximity
+    to a past destination without claiming measured motion or arrival.
+
+    Engine order 49 is Follow, a unit-target movement order. Some successful
+    regroup commands clicked a friendly unit or the Command Center and
+    produced Follow rather than Move. The earlier summary called this an
+    unknown order and the verifier rejected it. Follow is now described
+    explicitly, including that it may remain active near its target; the order
+    itself is not proof of physical movement. See the
+    [BWAPI order enumeration](https://github.com/bwapi/bwapi/blob/main/bwapi/include/BWAPI/Order.h)
+    and [OpenBW's Follow implementation](https://github.com/OpenBW/openbw/blob/master/bwgame.h).

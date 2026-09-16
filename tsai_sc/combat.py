@@ -80,8 +80,8 @@ STRONGARM = MissionConfig(
 MISSION_PLAYBOOK = (
     "Establish mineral income early by assigning idle SCVs to visible mineral fields; idle workers earn nothing, and training more workers does not assign existing ones.",
     "Maintain replacements: when affordable, keep idle Barracks producing Marines, maintain supply, and rebuild or expand production capacity when needed. Mining and production continue concurrently with army orders; avoid stockpiling minerals while production is idle.",
-    "Assemble roughly 8–12 Marines together before an unsupported exploration or assault; total army size does not mean scattered squads are a coherent force. After losses, rebuild and regroup near an observed friendly base instead of feeding isolated replacements toward exposed survivors. Immediate defense against observed attacks can take priority; existing combat continues while production runs.",
-    "Explore the unseen map with a supported force while maintaining income and replacements. Follow observed threats and known objectives; use current orders and observed positions to avoid needless reversals. No fixed route is supplied.",
+    "Assemble roughly 8–12 Marines together before an unsupported exploration or assault. A squad with at least 8 combat units within 192 pixels of an observed member has a coherent core: assembly is already achieved there, even away from base. This formation measurement does not guarantee combat strength or passability; consider composition, health and visible threats. After losses, rebuild and bring small reinforcements together rather than feeding isolated units forward. Immediate defense can take priority.",
+    "Advance a formed force toward observed objectives or unexplored terrain while income and replacements continue. New reinforcements or another distant squad do not invalidate its assembly. Preserve productive attack-move orders; pathfinding can temporarily move away from the destination or stretch a formation, so distance or spread alone does not prove failure. A return to base is a withdrawal, not a prerequisite to every advance. Regroup when the measured formation needs it, or withdraw for a tactical reason such as danger or losses. Squad names can change: compare actual members, core strength and orders. No fixed route is supplied.",
 )
 
 
@@ -182,6 +182,22 @@ def _squads(own: list[dict], mission: MissionConfig) -> list[tuple[str, list[dic
         remaining = [unit for unit in remaining if unit["id"] not in chosen]
         squads.append((names[len(squads)], nearby))
     return squads
+
+
+def _formation(squad: list[dict]) -> dict:
+    """Measure a member-centered core, without assuming terrain or combat success."""
+    cores = [(anchor, [unit for unit in squad if _distance(unit, anchor) <= 192]) for anchor in squad]
+    anchor, core = min(cores, key=lambda item: (-len(item[1]),
+                       sum(_distance(unit, item[0]) for unit in item[1]), item[0]["id"]))
+    formed = len(core) >= 8
+    return {
+        "member_count": len(squad), "marine_count": sum(unit["type_id"] == 0 for unit in squad),
+        "core_radius_pixels": 192, "core_anchor_member_id": anchor["id"],
+        "core_anchor_position": _point(anchor), "core_member_ids": sorted(unit["id"] for unit in core),
+        "core_count": len(core), "core_marine_count": sum(unit["type_id"] == 0 for unit in core),
+        "has_coherent_8plus_core": formed,
+        "assembly_status": "Coherent core already assembled here." if formed else "Fewer than 8 combat units in this measured core.",
+    }
 
 
 def _put(actions: dict[str, CombatAction], title: str, action: CombatAction) -> None:
@@ -314,6 +330,7 @@ def candidates(state: dict, mission: MissionConfig = STRONGARM, history: list[di
     army_center = _center([unit for _, squad in squads for unit in squad]) if squads else None
     for name, squad in squads:
         center = _center(squad)
+        formation = _formation(squad)
         unit_ids = sorted(unit["id"] for unit in squad)
         nearby_enemies = sorted(enemies, key=lambda unit: (_distance(unit, center), unit["id"]))
         # Each target is currently visible. A bounded nearest-target shortlist is
@@ -345,13 +362,16 @@ def candidates(state: dict, mission: MissionConfig = STRONGARM, history: list[di
             if _distance(home, center) >= 192:
                 _put(actions, f"{name}: regroup at friendly base", {
                     "kind": CombatKind.REGROUP.value,
-                    "label": f"{name}: regroup near the observed friendly {home.get('type', 'base')} to assemble with replacements; ordinary movement can interrupt fighting",
+                    "label": (f"{name}: withdraw to the observed friendly {home.get('type', 'base')}; this squad already has a coherent core here, so this returns a formed force toward base" if formation["has_coherent_8plus_core"] else
+                              f"{name}: regroup near the observed friendly {home.get('type', 'base')} to assemble with replacements") + "; ordinary movement replaces current attack or advance orders",
                     "units": unit_ids.copy(), "squad": name, "point": _point(home),
                 })
         spread = max(_distance(unit, center) for unit in squad)
         if army_center is not None and (_distance(center, army_center) >= 96 or spread >= 96):
             _put(actions, f"{name}: regroup with friendly force", {
-                "kind": CombatKind.REGROUP.value, "label": f"{name}: move toward the current friendly combat-force center to regroup",
+                "kind": CombatKind.REGROUP.value, "label": f"{name}: move toward the current friendly combat-force center ({round(_distance(center, army_center))} pixels from this squad's center) to regroup; " +
+                    ("a coherent core is already assembled here; " if formation["has_coherent_8plus_core"] else "") +
+                    "ordinary movement replaces current attack or advance orders",
                 "units": unit_ids.copy(), "squad": name, "point": dict(army_center),
             })
         for region in mission.known_regions[:4]:
@@ -385,6 +405,12 @@ def candidates(state: dict, mission: MissionConfig = STRONGARM, history: list[di
                 "kind": CombatKind.EXPLORE.value, "label": f"{name}: cautiously advance {direction} with attack-move to reveal terrain and engage encountered enemies",
                 "units": unit_ids.copy(), "squad": name, "point": point,
             })
+        # Names can change as pool slots are reused or reinforcements arrive.
+        # Attach the actual current formation to every concrete squad command.
+        description = f"{name} ({len(squad)} units; {formation['core_count']} within 192px of one member)"
+        for action in actions.values():
+            if action.get("squad") == name:
+                action["label"] = action["label"].replace(name + ":", description + ":", 1)
     if len(actions) > 255:
         raise CombatStateError("The combat action menu exceeds the model's choice limit.")
     _economy_candidates(state, own, actions)
@@ -397,7 +423,7 @@ def _unit_summary(unit: dict, origin: dict | None = None, *, owned: bool) -> dic
     result = {"id": unit["id"], "type": unit.get("type", "Unknown unit"), "hp": unit["hp"],
               "position": _point(unit), "completed": unit.get("completed", False),
               "engine_order_id": unit.get("order_id"), "visible": unit.get("visible", False)}
-    result["current_activity"] = {3: "standing guard", 6: "moving", 10: "attacking a target", 14: "attack-moving"}.get(unit.get("order_id"), "other engine order")
+    result["current_activity"] = {3: "standing guard", 6: "moving", 10: "attacking a target", 14: "attack-moving", 49: "following a unit"}.get(unit.get("order_id"), "other engine order")
     if origin is not None:
         result.update(direction=_direction(origin, unit), distance_pixels=round(_distance(origin, unit)))
     for key in ("generation", "max_hp", "shields", "ground_weapon_cooldown", "air_weapon_cooldown", "weapon_cooldown", "combat_stats", "kills"):
@@ -457,6 +483,7 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
         squad_state.append({
             "name": name, "composition": dict(Counter(unit.get("type", "unit") for unit in squad)),
             "center": center, "total_hp": sum(unit["hp"] for unit in squad),
+            "formation": _formation(squad),
             "spread_pixels": round(max(_distance(unit, center) for unit in squad)),
             "members": [{key: value for key, value in _unit_summary(unit, owned=True).items()
                          if key in {"id", "generation", "type", "hp", "position", "current_activity", "order_target"}} for unit in squad],
@@ -511,6 +538,12 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
                                            "matched_member_ids": sorted(unit["id"] for unit in matched),
                                            "matched_member_generations": {str(unit["id"]): unit["generation"] for unit in matched if "generation" in unit},
                                            "accepted": latest.get("accepted"), "note": "Applies only to matched members, irrespective of current squad name. Acceptance confirms input, not arrival; current orders remain authoritative." + legacy_note}
+            squad["last_advance_order"]["current_observation"] = {
+                "matched_members_with_attack_move_order": sorted(unit["id"] for unit in matched if own_by_id[unit["id"]].get("order_id") == 14),
+                "matched_members_standing_guard": sorted(unit["id"] for unit in matched if own_by_id[unit["id"]].get("order_id") == 3),
+                "matched_members_within96px_of_destination": sorted(unit["id"] for unit in matched if _distance(unit["position"], latest["point"]) <= 96),
+                "interpretation": "Attack-move orders can continue while another squad or production receives a command. Guard is not a march; a past accepted advance is not proof of a currently active order, arrival, or measured movement.",
+            }
     economic_workers = []
     for unit in own:
         if unit["type_id"] != 7:
@@ -522,8 +555,11 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
     current_activity = {
         "living_combat_units": len(combat_units),
         "largest_selectable_squad": max((len(squad) for _, squad in squads), default=0),
+        "largest_coherent_core": max((squad["formation"]["core_count"] for squad in squad_state), default=0),
+        "squads_with_coherent_8plus_core": sum(squad["formation"]["has_coherent_8plus_core"] for squad in squad_state),
         "combat_order_counts": dict(Counter(_unit_summary(unit, owned=True)["current_activity"] for unit in combat_units)),
-        "combat_units_moving_or_attacking": sum(unit.get("order_id") in {6, 10, 14} for unit in combat_units),
+        "combat_units_moving_or_attacking": sum(unit.get("order_id") in {6, 10, 14, 49} for unit in combat_units),
+        "movement_count_note": "Counts Move, Follow, AttackUnit and AttackMove engine orders, not measured physical movement. Follow can remain active near its target.",
         "worker_count": len(economic_workers),
         "mineral_workers": sum(worker["current_job"] == "gathering minerals" for worker in economic_workers),
         "idle_workers": sum(worker["current_job"] == "idle/other" for worker in economic_workers),
@@ -558,7 +594,7 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
         "recent_model_orders": recent[-8:],
         "previously_ordered_exploration_destinations": exploration_orders,
         "previously_observed_friendly_positions": list(observed_positions.values())[-24:],
-        "current_orders_are_authoritative": "Standing guard means idle until an enemy enters range; it is not an ongoing march. Previously accepted movement may have ended. Continue issues no new command and preserves the current observed activities, including any idle units.",
+        "current_orders_are_authoritative": "Standing guard means idle until an enemy enters range; it is not an ongoing march. Follow 49 is a unit-target movement order and can remain active after getting close. Engine orders describe intent, not measured velocity. Previously accepted movement may have ended. Continue preserves current activities, including idle units; a production or other-squad command also preserves a formed force's current advance.",
         "observation_limits": "Only owned units and currently visible hostiles/allies, plus up to32 recorded prior visible enemy structures with explicitly uncertain current presence. Attack-move options may revisit the four most recent structure sightings; focus fire still requires current visibility. Focus options use the four nearest visible enemies per squad; squad summaries show the eight nearest. Up to eight nearby squads of twelve are offered. Candidate geometry does not reveal terrain passability; the original engine resolves movement. No never-observed base coordinates or winning route are provided.",
     }
     assignment = next((action for action in actions.values() if action["kind"] == CombatKind.GATHER.value), None)
@@ -578,7 +614,7 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
     for key, action in actions.items():
         if action["kind"] == CombatKind.CONTINUE.value:
             questions["action"]["criteria"][key] = (
-                f"Issue no command; preserve current activities: {current_activity['combat_units_moving_or_attacking']} combat units moving/attacking, "
+                f"Issue no command; preserve current activities: {current_activity['combat_units_moving_or_attacking']} combat units with move/follow/attack orders (not measured movement), "
                 f"{current_activity['mineral_workers']} mineral workers, {current_activity['queued_production']} queued units. "
                 "Idle/guard units remain idle; no new mining, production or scouting begins."
             )
@@ -625,13 +661,13 @@ def graph_request_for(state: dict, actions: dict[str, CombatAction], history: li
     descriptions = {
         "Economy": "Issue a worker, production, or supply command. Existing military orders continue independently.",
         "Engage": "Issue a squad attack against a currently visible hostile target or attack-move toward an explicitly known or last-seen objective; stale sightings remain uncertain.",
-        "Explore": "Issue a squad attack-move to reveal terrain and look for remaining hostile forces or the rebel base.",
-        "Reposition": "Move a squad to regroup or retreat; ordinary movement can interrupt firing or an advance.",
+        "Explore": "Issue a squad attack-move to reveal terrain and look for remaining hostile forces or the rebel base. A coherent core is already assembled wherever it currently stands; maintaining replacements does not require returning that force to base.",
+        "Reposition": "Move a squad to regroup or retreat; ordinary movement replaces firing or an advance. Consider formation.core_count: regrouping a coherent core is an optional reposition or withdrawal, not unfinished assembly. Small reinforcements and threatened forces can still benefit.",
         "Continue": "Issue no new command; preserve only the currently observed activities.",
     }
     questions = {"intent": {
         "type": "choice",
-        "instructions": "Choose which kind of gameplay command would make the most useful progress toward completing the mission from the CURRENT observed state. Use the mission_playbook: establish income, maintain Marine production and capacity, and assemble roughly 8–12 Marines together near an observed friendly base before an unsupported push. Check largest_selectable_squad rather than total scattered troops. After losses, rebuild and assemble replacements instead of feeding isolated units forward; urgent observed defense can take priority. Explore and revisit known objectives with a supported force while sustaining replacements. Compare each category's best available command, regardless of option count. Continue starts no new activity; current economic and combat orders continue while another command is issued. Select a category; independent companion questions recommend its concrete commands.",
+        "instructions": "Choose which kind of gameplay command would make the most useful progress toward completing the mission from the CURRENT observed state. Use the mission_playbook: establish income and maintain Marine production. Check each squad's formation, not its name or the total scattered army. At least 8 combat units in a measured 192px core means that force is already assembled there; it can sustain a supported advance while replacements are produced or smaller groups regroup. A distant reinforcement does not require reversing the formed force. After losses, rebuild; visible threats and health can justify retreat even for a formed force. Explore and revisit known objectives while sustaining replacements. Compare each category's best available command, regardless of option count. Continue starts no new activity; production and commands to other squads preserve an existing advance. Select a category; independent companion questions recommend its concrete commands.",
         "criteria": {},
     }}
     routing = graph_routing(actions)
@@ -645,7 +681,7 @@ def graph_request_for(state: dict, actions: dict[str, CombatAction], history: li
         if question_id is not None:
             questions[question_id] = {
                 "type": "choice",
-                "instructions": f"Assuming a {category.lower()} command is to be issued, choose the available concrete command that best advances the mission from the current observations and mission_playbook. Establish income and production; after losses assemble roughly 8–12 Marines together near an observed friendly base instead of sending isolated replacements forward, unless immediate defense is needed. This is an independent recommendation, used only if the separate intent decision selects {category}. Compare actors, targets, health, current orders, resources, and observed positions. Avoid reversing a productive supported advance without a tactical reason. Last-seen structures may be revisited but their continued presence is uncertain; never-observed locations remain unknown. Choose one actual gameplay command.",
+                "instructions": f"Assuming a {category.lower()} command is to be issued, choose the available concrete command that best advances the mission from the current observations and mission_playbook. Maintain income and production. A measured core of at least 8 combat units is already assembled at its present location; a return to base is a withdrawal, not required assembly. After losses, rebuild and gather small reinforcements; health and visible danger can justify retreat. This is an independent recommendation, used only if the separate intent decision selects {category}. Compare actual members, formation, targets, health, current orders, resources, and observed positions. Preserve a productive supported advance unless there is a tactical reason to replace it; production and commands to other squads run concurrently. Last-seen structures may be revisited but their continued presence is uncertain; never-observed locations remain unknown. Choose one actual gameplay command.",
                 "criteria": {key: flat_criteria[key] for key in candidate_ids},
             }
     return model_state, questions, routing

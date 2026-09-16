@@ -116,7 +116,10 @@ answer would instead require a later request, as described in the
 The prompt includes ordinary StarCraft guidance: establish mineral income,
 produce affordable reinforcements while other orders continue, assemble roughly
 eight to twelve Marines together before an unsupported push, rebuild after
-losses, and explore for remaining enemies. These instructions
+losses, and explore for remaining enemies. A measured core of at least eight
+combat units within 192 pixels of one member explicitly marks assembly complete;
+the prompt distinguishes reinforcing small groups from withdrawing a formed
+force, and allows pathfinding detours. These instructions
 contain no enemy-base coordinates or predetermined mission route.
 
 | Model choice | Candidate supplied by the harness | Original game controls |
@@ -131,7 +134,8 @@ contain no enemy-base coordinates or predetermined mission route.
 | Continue current orders | Keep persistent orders in progress | No new input |
 
 The deterministic adapter groups nearby selectable combat units into squads of
-at most twelve, selects them with ordinary clicks and Shift-clicks, pans the
+at most twelve, selects them with ordinary clicks, Shift-clicks, and a small
+selection-box fallback for obscured units, pans the
 camera, and requires the full surviving selectable squad to be selected before
 issuing its order. Mouse clicks are queued against paused position snapshots;
 each click's resulting selection is checked. It supplies up to eight

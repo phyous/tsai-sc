@@ -2,6 +2,7 @@
 
 import copy
 import json
+import math
 import unittest
 
 from tsai_sc.combat import (
@@ -338,6 +339,70 @@ class CombatTests(unittest.TestCase):
         self.assertEqual(model["current_activity"]["largest_selectable_squad"], 4)
         self.assertIn("8–12 Marines together", model["mission_playbook"][2])
         self.assertIn("Immediate defense", model["mission_playbook"][2])
+
+    def test_twelve_member_formed_force_keeps_all_actions_and_labels_base_return_as_withdrawal(self):
+        observed = state()
+        observed["units"] = [unit(i, x=1000 + (i % 4) * 20, y=800 + (i // 4) * 20) for i in range(12)]
+        observed["units"].extend([unit(30, 106, x=280, y=320, name="Command Center"),
+                                   unit(40, x=2400, y=800), unit(50, owner=0, x=1300, y=800)])
+        actions = candidates(observed)
+        model, questions, _ = graph_request_for(observed, actions)
+        formation = model["squads"][0]["formation"]
+        self.assertEqual(formation["member_count"], 12)
+        self.assertEqual(formation["core_count"], 12)
+        self.assertTrue(formation["has_coherent_8plus_core"])
+        self.assertEqual(set(formation["core_member_ids"]), set(range(12)))
+        self.assertEqual(model["current_activity"]["squads_with_coherent_8plus_core"], 1)
+        self.assertEqual(model["current_activity"]["largest_coherent_core"], 12)
+        base = actions["Alpha: regroup at friendly base"]
+        self.assertEqual(base["units"], list(range(12)))
+        self.assertEqual(base["point"], {"x": 280, "y": 320})
+        self.assertIn("withdraw", base["label"])
+        self.assertIn("already has a coherent core", base["label"])
+        self.assertIn("12 units", base["label"])
+        self.assertIn("Alpha: regroup with friendly force", actions)
+        self.assertTrue({"attack_target", "attack_move", "retreat", "regroup", "explore"}.issubset(
+            {action["kind"] for action in actions.values() if action.get("squad") == "Alpha"}))
+        self.assertIn("already assembled", questions["intent"]["instructions"])
+        self.assertIn("replacements", questions["intent"]["instructions"])
+
+    def test_twelve_selectable_but_scattered_units_do_not_claim_completed_assembly(self):
+        observed = state()
+        # Every member is selectable with the center anchor, but no member has
+        # eight neighbors within192px. Total/selection count alone is insufficient.
+        observed["units"] = [unit(0, x=1000, y=800)] + [
+            unit(i + 1, x=round(1000 + 350 * math.cos(i * 2 * math.pi / 11)),
+                 y=round(800 + 350 * math.sin(i * 2 * math.pi / 11))) for i in range(11)]
+        model, _ = request_for(observed, candidates(observed))
+        self.assertEqual(model["current_activity"]["largest_selectable_squad"], 12)
+        formation = model["squads"][0]["formation"]
+        self.assertLess(formation["core_count"], 8)
+        self.assertFalse(formation["has_coherent_8plus_core"])
+        self.assertEqual(model["current_activity"]["squads_with_coherent_8plus_core"], 0)
+        anchor = formation["core_anchor_position"]
+        actual_core = {u["id"] for u in observed["units"] if math.hypot(u["x"] - anchor["x"], u["y"] - anchor["y"]) <= 192}
+        self.assertEqual(set(formation["core_member_ids"]), actual_core)
+
+    def test_follow_orders_are_described_without_claiming_measured_motion_or_arrival(self):
+        observed = state()
+        observed["units"][0].update(order_id=49, order_target={"x": 424, "y": 400})
+        model, questions = request_for(observed, candidates(observed))
+        self.assertEqual(model["squads"][0]["current_order_counts"], {"following a unit": 1, "standing guard": 1})
+        self.assertEqual(model["current_activity"]["combat_units_moving_or_attacking"], 1)
+        self.assertIn("not measured", model["current_activity"]["movement_count_note"])
+        self.assertIn("not measured movement", questions["action"]["criteria"]["Continue current orders"])
+
+    def test_advance_observation_distinguishes_current_orders_proximity_and_past_acceptance(self):
+        observed = state()
+        observed["units"][0].update(order_id=14, x=650)
+        observed["units"][1].update(order_id=3, x=795)
+        history = [{"kind": "explore", "units": [1, 2], "point": {"x": 800, "y": 400}, "accepted": True}]
+        model, _ = request_for(observed, candidates(observed), history)
+        current = model["squads"][0]["last_advance_order"]["current_observation"]
+        self.assertEqual(current["matched_members_with_attack_move_order"], [1])
+        self.assertEqual(current["matched_members_standing_guard"], [2])
+        self.assertEqual(current["matched_members_within96px_of_destination"], [2])
+        self.assertIn("not proof", current["interpretation"])
 
     def test_barracks_building_options_enforce_cost_count_and_construction_limits(self):
         observed = state()

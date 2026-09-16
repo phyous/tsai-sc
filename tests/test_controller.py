@@ -598,7 +598,32 @@ class TacticalControllerTests(unittest.TestCase):
         self.assertEqual(result['selected_units'], [1])
         self.assertEqual(result['missing_units'], [2])
         self.assertFalse(any(call[0] == 'keyHold' for call in bridge.calls))
-        self.assertEqual(sum(call == ('clickHold', 360, 136, 1, 0) for call in bridge.calls), 2)
+        self.assertEqual(sum(call == ('clickHold', 360, 136, 1, 0) for call in bridge.calls), 1)
+        self.assertEqual(sum(call == ('drag', 356, 132, 364, 140, 0) for call in bridge.calls), 1)
+
+    def test_tiny_box_recovers_occluded_requested_unit_after_click_misses(self):
+        for dragged_selection in ([1, 2], [1, 2, 3]):
+            with self.subTest(dragged_selection=dragged_selection):
+                state = self.state()
+                bridge = Bridge()
+                adapter = InputAdapter(bridge)
+                adapter._settle = lambda *args: None
+                def selection(_):
+                    if any(call[0] == 'drag' for call in bridge.calls):
+                        return dragged_selection
+                    return [1] if any(call[0] == 'clickHold' for call in bridge.calls) else []
+                with patch('tsai_sc.controller.read_state', return_value=state), \
+                        patch('tsai_sc.controller.read_selection', side_effect=selection):
+                    result = adapter.execute(state, self.action())
+                self.assertEqual(result['issued'], dragged_selection == [1, 2])
+                self.assertEqual(result['selected_units'], dragged_selection)
+                self.assertEqual(sum(call[0] == 'drag' for call in bridge.calls), 1)
+                self.assertIn(('drag', 356, 132, 364, 140, 0), bridge.calls)
+                self.assertIn(('drag', False), bridge.input_running)
+                self.assertEqual(result['selection_checks'][-1]['method'], 'box_drag')
+                if dragged_selection != [1, 2]:
+                    self.assertFalse(any(call[0] == 'keyHold' for call in bridge.calls))
+                self.assertFalse(bridge.running)
 
     def test_shift_is_queued_before_final_moving_actor_snapshot(self):
         state = self.state()
@@ -703,6 +728,89 @@ class TacticalControllerTests(unittest.TestCase):
         self.assertFalse(verify_command(state, after, action)['accepted'])
         actor['order_target'] = action['point']
         self.assertTrue(verify_command(state, after, action)['accepted'])
+
+    def test_regroup_or_retreat_can_follow_a_friendly_at_the_destination(self):
+        for kind in ('regroup', 'retreat'):
+            with self.subTest(kind=kind):
+                before = self.state()
+                before['allied_players'] = [2, 6]
+                before['units'][2].update(owner=2, x=500, y=560, generation=3)
+                before['units'][0]['generation'] = 4
+                after = copy.deepcopy(before)
+                actor, target = after['units'][0], after['units'][2]
+                actor.update(order_id=49, order_target_address=target['address'])
+                # A Follow target's live pointer/position is authoritative even
+                # when its cached order_target coordinate has not caught up.
+                actor['order_target'] = {'x': 0, 'y': 0}
+                self.assertTrue(verify_command(before, after, self.action(kind))['accepted'])
+
+    def test_follow_accepts_clicks_inside_friendly_building_footprint(self):
+        before = self.state()
+        after = copy.deepcopy(before)
+        actor, target = after['units'][0], after['units'][3]
+        actor.update(order_id=49, order_target_address=target['address'])
+        action = self.action('regroup')
+        action['point'] = {'x': target['x'] + 60, 'y': target['y'] + 44}
+        self.assertTrue(verify_command(before, after, action)['accepted'])
+        action['point']['x'] = target['x'] + 100
+        self.assertFalse(verify_command(before, after, action)['accepted'])
+
+    def test_follow_rejects_unrelated_hostile_missing_or_dead_targets(self):
+        for change in ({'x': 900}, {'owner': 3}, {'hp': 0}):
+            with self.subTest(change=change):
+                before = self.state()
+                before['units'][2].update(x=500, y=560)
+                after = copy.deepcopy(before)
+                actor, target = after['units'][0], after['units'][2]
+                actor.update(order_id=49, order_target_address=target['address'],
+                             order_target={'x': 500, 'y': 560})
+                target.update(change)
+                self.assertFalse(verify_command(before, after, self.action('regroup'))['accepted'])
+        before = self.state()
+        after = copy.deepcopy(before)
+        actor = after['units'][0]
+        for address in (None, 0, 0xDEADBEEF):
+            actor.update(order_id=49, order_target_address=address)
+            self.assertFalse(verify_command(before, after, self.action('regroup'))['accepted'])
+
+    def test_follow_does_not_accept_recycled_actor_or_target_identity(self):
+        before = self.state()
+        before['units'][0]['generation'] = 1
+        before['units'][2].update(x=500, y=560, generation=2)
+        for index in (0, 2):
+            with self.subTest(index=index):
+                after = copy.deepcopy(before)
+                after['units'][0].update(order_id=49, order_target_address=after['units'][2]['address'])
+                after['units'][index]['generation'] += 1
+                self.assertFalse(verify_command(before, after, self.action('regroup'))['accepted'])
+
+    def test_follow_honors_explicit_target_and_is_not_attack_acceptance(self):
+        before = self.state()
+        before['units'][2].update(x=500, y=560)
+        after = copy.deepcopy(before)
+        after['units'][0].update(order_id=49, order_target_address=after['units'][2]['address'])
+        action = self.action('regroup')
+        action['target'] = 4
+        self.assertFalse(verify_command(before, after, action)['accepted'])
+        action['target'] = 3
+        self.assertTrue(verify_command(before, after, action)['accepted'])
+        for kind in ('attack_move', 'explore'):
+            self.assertFalse(verify_command(before, after, self.action(kind))['accepted'])
+
+    def test_follow_requires_observed_ally_and_matches_recorded_actor_generation(self):
+        before = self.state()
+        before['allied_players'] = [2, 6]
+        before['units'][0]['generation'] = 5
+        before['units'][2].update(owner=2, x=500, y=560)
+        after = copy.deepcopy(before)
+        after['units'][0].update(order_id=49, order_target_address=after['units'][2]['address'])
+        action = self.action('regroup')
+        action['unit_generations'] = {'1': 4}
+        self.assertFalse(verify_command(before, after, action)['accepted'])
+        action['unit_generations']['1'] = 5
+        self.assertTrue(verify_command(before, after, action)['accepted'])
+        after['units'][2]['visible'] = False
+        self.assertFalse(verify_command(before, after, action)['accepted'])
 
     def test_focus_verification_matches_target_pointer(self):
         state = self.state()

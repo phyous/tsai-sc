@@ -92,8 +92,16 @@ def verify(directory):
         rejected_tokens += metadata.get('rejected_input_tokens', 0)
         unknown_usage += metadata.get('rejected_usage_unavailable_attempts', 0)
         for event in decision['input_result']['inputs']:
-            if event['command'] not in {'clickHold', 'keyHold', 'key', 'move'}:
+            if event['command'] not in {'clickHold', 'keyHold', 'key', 'move', 'drag'}:
                 raise ValueError('Unexpected command outside ordinary game inputs')
+            if event['command'] == 'drag':
+                args = event.get('args')
+                if (not isinstance(args, list) or len(args) != 5
+                        or any(type(value) is not int for value in args)
+                        or not (0 <= args[0] < 640 and 0 <= args[2] < 640
+                                and 0 <= args[1] < 480 and 0 <= args[3] < 480)
+                        or args[4] != 0):
+                    raise ValueError('Invalid ordinary mouse selection drag')
     final = result['final_state']
     if 'api_attempts' in result and result['api_attempts'] != attempts:
         raise ValueError('API-attempt count does not match the decision log')

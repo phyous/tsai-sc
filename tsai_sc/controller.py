@@ -52,11 +52,47 @@ def verify_command(before, after, action):
         # A previous attack does not prove a new retreat was accepted. Match the
         # order family and destination, allowing attack-move to acquire enemies.
         point = action['point']
+        before_units = {u['id']: u for u in before['units']}
+
+        def same_identity(previous, current):
+            return all(previous.get(key) == current.get(key)
+                       for key in ('id', 'address', 'owner', 'type_id', 'generation')
+                       if key in previous or key in current)
+
+        def follows_requested_destination(actor):
+            # Original Move-click on a friendly sprite becomes Follow49. The
+            # pointer must resolve to a live friendly at this destination;
+            # the order number alone is not evidence of the requested move.
+            previous_actor = before_units.get(actor['id'])
+            if (actor.get('owner') != after['player_id'] or actor.get('hp', 0) <= 0
+                    or previous_actor is None or not same_identity(previous_actor, actor)):
+                return False
+            generation = action.get('unit_generations', {}).get(str(actor['id']))
+            if generation is not None and actor.get('generation') != generation:
+                return False
+            address = actor.get('order_target_address')
+            if type(address) is not int or address <= 0:
+                return False
+            target = next((u for u in after['units'] if u.get('address') == address), None)
+            friendly = {after['player_id'], *after.get('allied_players', [])}
+            if (target is None or target.get('hp', 0) <= 0 or target.get('owner') not in friendly
+                    or target.get('owner') in after.get('enemy_players', [])
+                    or (target.get('owner') != after['player_id'] and target.get('visible') is not True)
+                    or ('target' in action and action['target'] != target['id'])):
+                return False
+            previous_target = before_units.get(target['id'])
+            if previous_target is not None and not same_identity(previous_target, target):
+                return False
+            width, height = BUILDING_SIZE.get(target['type_id'], (0, 0))
+            dx = max(0, abs(target['x'] - point['x']) - width / 2)
+            dy = max(0, abs(target['y'] - point['y']) - height / 2)
+            return math.hypot(dx, dy) <= (16 if width else 48)
+
         def matches(u):
             destination = u.get('order_target', {})
             near = isinstance(destination, dict) and 'x' in destination and math.dist((destination['x'], destination['y']), (point['x'], point['y'])) <= 48
             if kind in {'retreat', 'regroup'}:
-                return u['order_id'] == 6 and near
+                return (u['order_id'] == 6 and near) or (u['order_id'] == 49 and follows_requested_destination(u))
             if kind == 'attack_target':
                 target = next((t for t in before['units'] if t['id'] == action['target']), None)
                 return u['order_id'] == 10 and target is not None and u.get('order_target_address') == target.get('address')
@@ -273,9 +309,10 @@ class InputAdapter:
             return {'selected_units': actual, 'available_requested_units': sorted(available),
                     'selection_method': 'already_selected'}
         checks = []
+        missed_clicks = set()
         # A missed/toggled click may be retried once, but never accepted as a
         # smaller squad while other requested units remain alive and visible.
-        for _ in range(2):
+        for attempt in range(2):
             for unit_id in action['units'][:12]:
                 self.bridge.pause()
                 fresh = read_state(self.bridge.read_memory)
@@ -301,7 +338,15 @@ class InputAdapter:
                     point = game_to_screen(actor['x'], actor['y'], fresh['camera'], height=312) if actor else None
                     if point is None:
                         continue
-                    self._queue_input('clickHold', point['x'], point['y'], 1, 0)
+                    method = 'box_drag' if attempt and unit_id in missed_clicks else 'click'
+                    if method == 'box_drag':
+                        # A Marine can stand behind building artwork: a point
+                        # click hits the roof, while a tiny ordinary selection
+                        # rectangle can recover that same requested unit.
+                        self._queue_input('drag', max(1, point['x'] - 4), max(1, point['y'] - 4),
+                                          min(638, point['x'] + 4), min(310, point['y'] + 4), 0)
+                    else:
+                        self._queue_input('clickHold', point['x'], point['y'], 1, 0)
                     self.bridge.resume()
                     self._settle()
                 finally:
@@ -309,7 +354,9 @@ class InputAdapter:
                     if extend:
                         self._queue_input('key', 'shift', {'up': True})
                 actual = read_selection(self.bridge.read_memory)
-                checks.append({'clicked_unit': unit_id, 'selected_units': list(actual)})
+                checks.append({'clicked_unit': unit_id, 'method': method, 'selected_units': list(actual)})
+                if method == 'click' and unit_id not in actual:
+                    missed_clicks.add(unit_id)
                 if not set(actual).issubset(requested):
                     return {'issued': False, 'inputs': list(self.inputs),
                             'reason': 'Observed selection contains an unrequested unit',

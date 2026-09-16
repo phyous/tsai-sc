@@ -239,6 +239,19 @@ class VerificationTests(unittest.TestCase):
         self.write_logs()
         self.assertEqual(verify(self.root)['outcome'], 'victory')
 
+    def test_mouse_selection_drag_is_allowed_only_inside_canvas(self):
+        self.decisions[0]['input_result']['inputs'].append({'command': 'drag', 'args': [96, 96, 104, 104, 0]})
+        self.write_logs()
+        self.assertEqual(verify(self.root)['outcome'], 'victory')
+        for args in ([96, 96, 104, 104], [-1, 96, 104, 104, 0],
+                     [96, 96, 640, 104, 0], [96, 96, 104, 480, 0],
+                     [96, 96, 104, 104, 1], [True, 96, 104, 104, 0]):
+            with self.subTest(args=args):
+                self.decisions[0]['input_result']['inputs'][-1]['args'] = args
+                self.write_logs()
+                with self.assertRaisesRegex(ValueError, 'mouse selection drag'):
+                    verify(self.root)
+
     def test_mission_path_matching_allows_case_and_slashes(self):
         self.result['engine_evidence']['map_path'] = 'CAMPAIGN/TERRANED/TUTORIAL'
         self.write_result()
