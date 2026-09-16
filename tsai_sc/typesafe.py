@@ -43,7 +43,9 @@ class TransportError(TypeSafeError):
 
 
 class ResponseValidationError(TypeSafeError):
-    pass
+    def __init__(self, message, diagnostics=None):
+        super().__init__(message)
+        self.diagnostics = diagnostics or {}
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -117,6 +119,23 @@ def _json_object(pairs):
     return result
 
 
+def probability_total_valid(values, *, rounded_choice=False):
+    """Accept exact totals, plus the observed one-point Choice rounding error.
+
+    Jev-1.13.0 sometimes returns cent-quantized Choice values totaling0.99
+    despite the documented sum1 contract. Preserve those reported values;
+    never renormalize. This narrow compatibility rule also permits1.01.
+    """
+    values = list(values)
+    if not values or not all(_number(value) for value in values):
+        return False
+    total = math.fsum(values)
+    if math.isclose(total, 1, abs_tol=1e-6, rel_tol=0):
+        return True
+    return (rounded_choice and any(math.isclose(total, limit, abs_tol=1e-8, rel_tol=0) for limit in (.99, 1.01))
+            and all(math.isclose(value * 100, round(value * 100), abs_tol=1e-8, rel_tol=0) for value in values))
+
+
 def _validate_questions(questions: Any) -> None:
     if not isinstance(questions, dict) or not questions:
         raise ConfigurationError("Questions must be a nonempty mapping.")
@@ -180,10 +199,18 @@ def validate_response(response: Any, questions: dict[str, dict]) -> dict:
             not isinstance(probabilities, dict)
             or set(probabilities) != expected
             or not all(_number(value) for value in probabilities.values())
-            or not math.isclose(math.fsum(probabilities.values()), 1.0, abs_tol=1e-6, rel_tol=0)
+            or not probability_total_valid(probabilities.values(), rounded_choice=kind == 'choice')
             or not _number(confidence)
         ):
-            raise ResponseValidationError(failure)
+            diagnostics = {'probability_map': isinstance(probabilities, dict), 'expected_options': len(expected)}
+            if isinstance(probabilities, dict):
+                numeric = all(_number(p, low=-1e100, high=1e100) for p in probabilities.values())
+                diagnostics.update(returned_options=len(probabilities), missing_options=len(expected - set(probabilities)),
+                                   unexpected_options=len(set(probabilities) - expected),
+                                   probability_sum=math.fsum(probabilities.values()) if numeric else None,
+                                   invalid_probabilities=sum(not _number(p) for p in probabilities.values()),
+                                   confidence_in_range=_number(confidence))
+            raise ResponseValidationError(failure, diagnostics)
         clean = {"type": kind, "probabilities": dict(probabilities), "confidence": confidence}
         if kind == "choice":
             choice = answer.get("choice")
@@ -344,6 +371,8 @@ class TypeSafeClient:
                         "rejected_input_tokens": rejected_input,
                         "rejected_output_tokens": rejected_output,
                         "rejected_usage_unavailable_attempts": rejected_unknown_usage,
+                        "reported_probability_totals": {name: math.fsum(answer['probabilities'].values())
+                                                        for name, answer in result['answers'].items() if 'probabilities' in answer},
                     }
                     return result
             if status is not None and (status not in RETRY_STATUSES or attempt >= self.max_retries):

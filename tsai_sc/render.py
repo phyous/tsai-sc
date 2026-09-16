@@ -19,6 +19,7 @@ import tempfile
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
+from .typesafe import probability_total_valid
 
 
 WIDTH, HEIGHT = 1600, 900
@@ -97,7 +98,7 @@ def choice_groups(record: dict) -> list[tuple[str, dict]]:
             or not 2 <= len(probabilities) <= 255
             or not all(isinstance(option, str) and option for option in probabilities)
             or not all(_finite(value, high=1) for value in probabilities.values())
-            or not math.isclose(math.fsum(probabilities.values()), 1, abs_tol=1e-6, rel_tol=0)
+            or not probability_total_valid(probabilities.values(), rounded_choice=True)
             or not isinstance(selected, str)
             or selected not in probabilities
             or not math.isclose(probabilities[selected], max(probabilities.values()), abs_tol=1e-9, rel_tol=0)
@@ -312,7 +313,10 @@ def compose_frame(record: dict, game: Image.Image, *, speed: float = 4, test_onl
     frame_text = str(observed_frame) if type(observed_frame) is int and observed_frame >= 0 else "—"
     decision_caption = f"Last Jev decision · observed frame {frame_text}" if groups else f"Observed frame {frame_text} · no Jev decision yet"
     _text(draw, (1048, 242), decision_caption, 14, MUTED)
-    _text(draw, (1048, 265), "Action choices, not a prediction of winning", 12, MUTED)
+    rounded = [math.fsum(answer['probabilities'].values()) for _, answer in groups
+               if not math.isclose(math.fsum(answer['probabilities'].values()), 1, abs_tol=1e-6, rel_tol=0)]
+    caption = f"API total {rounded[0]:.0%} (rounded; values shown unchanged)" if rounded else "Action choices, not a prediction of winning"
+    _text(draw, (1048, 265), caption, 12, MUTED)
 
     shown = groups[:3]
     area_top, area_height = 301, 363

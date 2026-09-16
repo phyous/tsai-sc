@@ -117,6 +117,31 @@ class ValidationTests(unittest.TestCase):
         self.assertLessEqual(len(safe_text("marine " * 100, 30)), 30)
         self.assertEqual(safe_text({"secret": "value"}), "—")
 
+    def test_rounded_api_totals_are_labeled_without_normalizing_bars(self):
+        import tsai_sc.render as module
+        for marine, total in ((0.72, 99), (0.74, 101)):
+            with self.subTest(total=total):
+                item = record()
+                item['decision']['answers']['action']['probabilities']['train_marine'] = marine
+                original = copy.deepcopy(item)
+                self.assertEqual(choice_groups(item)[0][1]['probabilities'],
+                                 original['decision']['answers']['action']['probabilities'])
+                with patch('tsai_sc.render._text', wraps=module._text) as draw_text:
+                    compose_frame(item, Image.new('RGB', (640, 480)), test_only=True)
+                labels = [str(call.args[2]) for call in draw_text.call_args_list]
+                self.assertIn(f'API total {total}% (rounded; values shown unchanged)', labels)
+                self.assertEqual(item, original)
+
+    def test_renderer_rejects_larger_and_noncent_probability_total_errors(self):
+        for values in (
+            {'train_marine': 0.71, 'gather_minerals': 0.19, 'wait': 0.08},
+            {'train_marine': 0.725, 'gather_minerals': 0.19, 'wait': 0.075},
+        ):
+            item = record()
+            item['decision']['answers']['action']['probabilities'] = values
+            with self.subTest(values=values), self.assertRaises(RenderError):
+                choice_groups(item)
+
     def test_original_boot_camp_objectives_are_shown_without_marine_target(self):
         summary = _objective(record()["state"])
         self.assertIn("supply depots: 2/3", summary)

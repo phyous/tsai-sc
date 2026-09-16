@@ -159,6 +159,12 @@ labels playback speed and decision pauses. Model probabilities are preserved
 unchanged. Frames contain only the 640×480 game canvas, with an independently
 rendered dashboard. No desktop, login screen, microphone, or API key is recorded.
 
+Observed API compatibility issue: some large Choice replies from `jev-1.13.0`
+return every option but round values to whole percentage points totaling 99%.
+The client permits only a 99% or 101% total when every value has that precision;
+it preserves the returned values and the video labels the reported total.
+Other malformed responses receive bounded retries and are never executed.
+
 ## Verify
 
 ```sh

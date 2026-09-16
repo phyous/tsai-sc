@@ -118,6 +118,7 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
                 if len(actions) > 1:
                     model_state, questions = (combat.request_for(state, actions, history, combat.STRONGARM)
                                               if is_combat else request_for(state, actions, history))
+                    write_json(recorder.directory / 'pending-request.json', {'state': model_state, 'questions': questions})
                     response = client.evaluate(model_state, questions)
                     choice = response['answers']['action']['choice']
                     selected = actions[choice]
@@ -181,7 +182,8 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
         reason = ('Run interrupted' if isinstance(error, KeyboardInterrupt) else str(error)
                   if isinstance(error, (TypeSafeError, GameStateError, RuntimeError))
                   else 'Run stopped after a local ' + type(error).__name__)
-        write_json(recorder.directory / 'incomplete.json', {'status': 'incomplete', 'reason': reason, 'model_calls': model_calls})
+        write_json(recorder.directory / 'incomplete.json', {'status': 'incomplete', 'reason': reason, 'model_calls': model_calls,
+                                                          'api_validation': getattr(error, 'diagnostics', {})})
         raise
     finally:
         try:

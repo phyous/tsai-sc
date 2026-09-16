@@ -123,6 +123,59 @@ class ClientTests(unittest.TestCase):
                     client.evaluate({}, QUESTIONS)
                 self.assertEqual(len(transport.requests), 1)
 
+    def test_cent_quantized_choice_rounding_is_preserved_and_disclosed(self):
+        for train, total in ((0.79, 0.99), (0.81, 1.01)):
+            with self.subTest(total=total):
+                data = api_response()
+                data['answers']['action']['probabilities']['train'] = train
+                original = copy.deepcopy(data)
+                client, transport, _ = self.client(Response(data), max_retries=0)
+                result = client.evaluate({}, QUESTIONS)
+                self.assertEqual(result['answers'], original['answers'])
+                self.assertEqual(data, original)
+                self.assertAlmostEqual(result['metadata']['reported_probability_totals']['action'], total)
+                self.assertEqual(result['metadata']['attempts'], 1)
+                self.assertEqual(result['metadata']['rejected_response_attempts'], 0)
+                self.assertEqual(len(transport.requests), 1)
+
+    def test_choice_rounding_exception_rejects_larger_or_noncent_errors(self):
+        probabilities = (
+            {'gather': 0.15, 'train': 0.78, 'wait': 0.05},  # 0.98
+            {'gather': 0.15, 'train': 0.82, 'wait': 0.05},  # 1.02
+            {'gather': 0.145, 'train': 0.8, 'wait': 0.045},  # 0.99, not cent-quantized
+            {'gather': 0.15, 'train': 0.795, 'wait': 0.05},  # 0.995, not an allowed total
+        )
+        for values in probabilities:
+            with self.subTest(values=values):
+                data = api_response()
+                data['answers']['action']['probabilities'] = values
+                client, _, _ = self.client(Response(data), max_retries=0)
+                with self.assertRaises(ResponseValidationError):
+                    client.evaluate({}, QUESTIONS)
+
+    def test_rounded_choice_still_requires_exact_options_and_maximum_choice(self):
+        for mutate in (
+            lambda answer: answer.update(choice='gather'),
+            lambda answer: answer['probabilities'].update(unrequested=0),
+            lambda answer: answer['probabilities'].pop('wait'),
+        ):
+            data = api_response()
+            data['answers']['action']['probabilities']['train'] = 0.79
+            mutate(data['answers']['action'])
+            client, _, _ = self.client(Response(data), max_retries=0)
+            with self.assertRaises(ResponseValidationError):
+                client.evaluate({}, QUESTIONS)
+
+    def test_score_does_not_allow_choice_rounding_exception(self):
+        questions = {'readiness': {'type': 'score', 'instructions': 'How ready?', 'criteria': ['Low', 'Medium', 'High']}}
+        data = {'model': 'jev-latest', 'usage': {'input_tokens': 100, 'output_tokens': 20},
+                'answers': {'readiness': {'type': 'score', 'score': 1.58, 'confidence': 0.7,
+                                         'probabilities': {'0': 0.1, '1': 0.2, '2': 0.69},
+                                         'legend': {'0': 'Low', '1': 'Medium', '2': 'High'}}}}
+        client, _, _ = self.client(Response(data), max_retries=0)
+        with self.assertRaises(ResponseValidationError):
+            client.evaluate({}, questions)
+
     def test_exact_answer_keys_and_integer_token_usage_required(self):
         mutations = [
             lambda r: r["answers"].update(unrequested=r["answers"]["action"]),
