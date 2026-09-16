@@ -1,0 +1,43 @@
+{
+  "mission": "Original StarCraft shareware Strongarm combat mission",
+  "outcome": "victory",
+  "models": [
+    "jev-1.13.0"
+  ],
+  "elapsed_wall_seconds": 1057.88,
+  "model_calls": 421,
+  "captured_frames": 3867,
+  "input_tokens": 9445640,
+  "api_attempts": 424,
+  "rejected_response_attempts": 3,
+  "rejected_usage_unavailable_attempts": 0,
+  "median_api_latency_ms": 382.95,
+  "mean_api_latency_ms": 414.07,
+  "final_objectives": {
+    "mission_victory": {
+      "current": 1,
+      "target": 1
+    }
+  },
+  "engine_evidence": {
+    "source": "original StarCraft shareware guest memory; read-only",
+    "map_path": "campaign\\terranED\\terran01",
+    "map_title": "TERRAN 1: \"Strongarm\"",
+    "game_mode": 3,
+    "executable_build": "StarCraft demo, June 24 1998",
+    "victory_address": 5227614,
+    "victory_value": 3,
+    "pending_victory_value": 3,
+    "victory_rule": "committed engine result 3; original trigger action 1",
+    "presentation_rule": "A committed outcome does not establish that the original victory dialog is visible; capture and inspect the dialog separately",
+    "visibility_rule": "owned units or sprite visibility mask for the player"
+  },
+  "visible_victory_frame": "victory-screen.png",
+  "visible_victory_frame_sha256": "f48a030ae92fb1fef00b40c6843697d680b10c380ec0aec2ff6d05c99bfc4e42",
+  "victory_screen_integrity_checked": true,
+  "visual_review": "A human must inspect the retained image for the original victory dialog; this verifier does not recognize screen text",
+  "trace_sha256": "64ba3cfd6fef6a81f3d43a0347b6090d1ed4e2c5c4bf16e71472e863ec71e1b6",
+  "decisions_sha256": "acd9d1c44df7d45d4089dbc3f0d6504e908bd87bb2f4e8a8e65586d41470ca8a",
+  "control": "Structured visible/owned game state; normal keyboard/mouse inputs; paused for snapshots and model inference",
+  "probabilities": "Actual Jev action distributions, not win probabilities"
+}

@@ -1,0 +1,32 @@
+{
+  "reviewed_utc": "2026-09-16T06:31:16.614355+00:00",
+  "review_method": "Codex visually inspected the original retained PNG.",
+  "mission": "Strongarm",
+  "image": "victory-screen.png",
+  "sha256": "f48a030ae92fb1fef00b40c6843697d680b10c380ec0aec2ff6d05c99bfc4e42",
+  "observed_text": [
+    "Congratulations!",
+    "You are victorious!",
+    "Victory"
+  ],
+  "engine_outcome": "victory",
+  "result": "The original result dialog is visible over the battlefield, with the destroyed enemy base behind it.",
+  "verifier_report": "verified-run.json",
+  "video_review": {
+    "short_file": "jev-starcraft-strongarm.mp4",
+    "sample_seconds": [
+      0.5,
+      112,
+      134
+    ],
+    "checks": [
+      "Original game canvas remains entirely visible.",
+      "Actual category and selected-branch probabilities are legible with Army/Economy labels.",
+      "8\u00d7 playback and paused decisions are labeled.",
+      "Final encoded frame visibly shows the original Victory dialog."
+    ],
+    "format": "H.264,1600x900,30fps,yuv420p,no audio",
+    "short_duration_seconds": 135.233333,
+    "full_duration_seconds": 1060.866667
+  }
+}

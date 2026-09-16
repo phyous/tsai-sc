@@ -1,0 +1,41 @@
+{
+  "python": "Python 3.14.7",
+  "ffmpeg": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers",
+  "bun": "1.4.2",
+  "chrome": "Google Chrome 149.0.7827.156 ",
+  "platform": "Darwin arm64",
+  "bottleship_commit": "a7c8543d75569d48890d48744897a0ffe3fb02f7",
+  "demo_bundle_sha256": "8a32a481e17ef6e6125a3f439c92e3fa0ae566ff638393e8f991ae79c09f3f9a",
+  "control": "Read-only visible/owned structured state; ordinary mouse and keyboard; paused for decisions.",
+  "source_commit": "d055e375ae131308fc38d617f63f8eff9c83edb6",
+  "model": "jev-1.13.0",
+  "mission": "Strongarm",
+  "development_attempt": 16,
+  "outcome": "victory",
+  "run_directory_name": "strongarm-16",
+  "capture": "Original DirectDraw CPU pixels and palette; game canvas only",
+  "runtime_patch": "0001-ddraw-present-conversion-buffer-lifetime.patch",
+  "initial_game_frame": 427,
+  "final_game_frame": 14573,
+  "capture_fps": 5,
+  "decision_seconds": 3,
+  "combat_decision_seconds": 0.5,
+  "separate_economy": true,
+  "model_calls": 421,
+  "api_attempts": 424,
+  "accounted_input_tokens": 9445640,
+  "elapsed_wall_seconds": 1057.8797489999852,
+  "videos": [
+    {
+      "file": "jev-starcraft-strongarm.mp4",
+      "playback_speed": 8,
+      "fps": 30
+    },
+    {
+      "file": "jev-starcraft-strongarm-full.mp4",
+      "playback_speed": 1,
+      "fps": 30
+    }
+  ],
+  "recording_note": "Continuous timestamped game-only capture with the last actual Jev probability distributions and a three-second final-frame hold. Inference and observations pause the game; input execution and configured waits advance it."
+}

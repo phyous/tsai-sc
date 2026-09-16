@@ -1,9 +1,11 @@
 # Lessons from developing the harness
 
-These notes describe development attempts through attempt 15 and subsequent
-changes and probes. They do not establish a combat victory or a measured improvement in
-win rate. Code checks, controlled game tests, and strategy hypotheses provide
-different kinds of evidence.
+These notes describe development through the verified Strongarm victory in
+attempt 16. Earlier attempts included interruptions and runtime faults; their
+numbering is not a count of completed matches or model defeats. One successful
+run does not establish a win rate or isolate which change produced the outcome.
+Code checks, controlled game tests, and strategy hypotheses provide different
+kinds of evidence.
 
 1. **A flat command list can obscure the strategic choice.** Earlier requests
    compared every concrete command in one Choice question. Numerous exploration
@@ -356,3 +358,25 @@ different kinds of evidence.
     and directs inspection toward a blocking dialog or runtime failure; it does
     not dismiss dialogs or synthesize an outcome. See the
     [runner guard](../tsai_sc/run.py).
+
+19. **Attempt 16 completed the original combat mission.** The original Strongarm
+    engine committed victory, the evidence verifier passed, and the retained
+    original “Congratulations! You are victorious!” screen was visually reviewed.
+    The run used source
+    [d055e37](https://github.com/phyous/tsai-sc/commit/d055e37), with separate
+    Economy and Army decision opportunities, a three-second baseline interval,
+    and a half-second interval for observed nearby combat.
+
+    `jev-1.13.0` made 421 recorded decisions over 17 minutes 37.88 seconds of
+    wall time. There were 424 API attempts, including three rejected responses;
+    accounted input usage was 9,445,640 tokens, including those rejections.
+    Median API latency was 382.95 ms, and 3,867 original game frames were captured.
+    See the [verification report](verified-run.json) and
+    [release artifact links](../README.md#verified-run) for the continuous
+    8× and 1× videos, victory image, and reproducible evidence bundle.
+
+    The model used structured owned/visible observations, normal mouse and
+    keyboard inputs, and paused inference. Probability overlays retain actual
+    model choices, not win predictions. This is evidence for one successful
+    mission under that harness; it does not turn the earlier frozen-state probes
+    into gameplay evidence or establish a reliable win rate.

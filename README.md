@@ -4,10 +4,11 @@ A TypeSafe System One harness for **Strongarm, the first combat mission in the
 original StarCraft shareware campaign**, with a game recording and Jev's actual
 action probabilities. Inspired by [TypeSafe's Doom demo](https://typesafe.ai/blog/introducing-system-one-models-and-jev).
 
-**Combat-run verification is pending.** A published winning run must include the
-original game's visible victory screen, matching engine outcome, decision log,
-and recorded probability distributions. Run results and video links will be
-added after those checks are complete.
+**Jev completed Strongarm.** Development attempt 16 reached the original game's
+committed victory outcome, and the captured “Congratulations! You are victorious!”
+screen was visually reviewed. The evidence verifier passed. Earlier development
+attempts included interrupted runs and runtime faults; “attempt 16” does not mean
+sixteen completed matches or sixteen model defeats.
 
 The original 1998 Windows executable runs inside [BottleShip](https://github.com/jenissimo/bottleship).
 The harness observes structured game state, asks `jev-latest` to choose a command,
@@ -17,6 +18,38 @@ structured-state decision pattern shown in the Doom demonstration; it does not
 use TypeSafe's Doom harness code. Screenshots are recorded for viewers, while
 the model receives structured observations. This is a bounded mission experiment,
 not a benchmark of real-time competitive play.
+
+## Verified run
+
+The winning run used source [d055e37](https://github.com/phyous/tsai-sc/commit/d055e37)
+with separate Economy and Army decision opportunities. See the
+[verification report](docs/verified-run.json), [runtime details](docs/run-environment.json),
+and [visual review](docs/visual-review.json).
+
+| Recorded measure | Result |
+| --- | --- |
+| Actual model | `jev-1.13.0` (requested as `jev-latest`) |
+| Model decisions | 421 |
+| Elapsed wall time | 17 min 37.88 sec |
+| API attempts | 424, including 3 rejected responses |
+| Accounted input tokens | 9,445,640, including rejected responses |
+| Median API latency | 382.95 ms |
+| Captured game frames | 3,867 |
+| Outcome | Original engine victory and visually reviewed victory screen |
+
+Video and evidence from release `v0.1.0`:
+
+- [8× video, about 2 min 15 sec](https://github.com/phyous/tsai-sc/releases/download/v0.1.0/jev-starcraft-strongarm.mp4): continuous playback with the actual probability overlay and a final hold.
+- [Full 1× video](https://github.com/phyous/tsai-sc/releases/download/v0.1.0/jev-starcraft-strongarm-full.mp4): continuous playback, including decision pauses.
+- [Original victory screen](https://github.com/phyous/tsai-sc/releases/download/v0.1.0/victory-screen.png).
+- [Reproducible evidence bundle](https://github.com/phyous/tsai-sc/releases/download/v0.1.0/strongarm-16-evidence.tar.gz): manifest, decisions, trace, referenced game frames, result, and verification report.
+
+![Original StarCraft Victory dialog](https://github.com/phyous/tsai-sc/releases/download/v0.1.0/victory-screen.png)
+
+The model received structured owned/visible state and issued ordinary mouse and
+keyboard commands, with inference paused. Displayed values are actual action
+probabilities, not chances of winning. This single successful development run
+does not establish a win rate.
 
 ## The mission
 
@@ -62,9 +95,9 @@ python -m tsai_sc.boot --mission strongarm
 python -m tsai_sc.run \
   --env-file "$HOME/.config/tsai-sc/env" \
   --run-dir runs/my-attempt \
-  --max-requests 1800 --max-seconds 3600 \
+  --max-requests 2000 --max-seconds 3600 \
   --decision-seconds 3 --combat-decision-seconds 0.5 \
-  --separate-economy
+  --separate-economy --capture-fps 5
 
 python -m tsai_sc.render runs/my-attempt \
   --output recordings/strongarm.mp4 --speed 4 --fps 30
@@ -178,8 +211,8 @@ Ground attack orders
 use the minimap to avoid turning a ground destination into a click on a building
 sprite; focus fire arms `A`, then refreshes the target's visibility, identity,
 and screen position before a paused 1 ms click. An unavailable target cancels
-that armed cursor. This refresh has regression coverage; live combat still
-needs to establish its effect on moving targets. Exploration geometry uses the squad's
+that armed cursor. This refresh has regression coverage; the timing checks do
+not isolate its effect on combat accuracy. Exploration geometry uses the squad's
 observed position and map bounds; the game determines terrain passability.
 Recent observed friendly positions help Jev track where it has already moved.
 Persistent 256-pixel visitation cells retain sampled owned combat positions
