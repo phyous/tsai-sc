@@ -5,6 +5,8 @@ import hashlib
 import json
 from pathlib import Path
 import statistics
+from PIL import Image
+from . import combat
 from .game import MISSIONS
 from .render import load_trace, resolve_frame
 from .typesafe import validate_response
@@ -34,6 +36,9 @@ def verify(directory):
         image_path = resolve_frame(root, victory_image)
         if hashlib.sha256(image_path.read_bytes()).hexdigest() != victory_image_hash:
             raise ValueError('Victory-screen image hash differs from the recorded result')
+        with Image.open(image_path) as captured:
+            if captured.format != 'PNG' or captured.size != (640, 480) or captured.convert('RGB').getbbox() is None:
+                raise ValueError('Victory-screen image must be a nonblank original 640x480 PNG')
     for filename, key in [('trace.jsonl', 'trace_sha256'), ('decisions.jsonl', 'decisions_sha256')]:
         digest = hashlib.sha256((root / filename).read_bytes()).hexdigest()
         if digest != result.get(key):
@@ -48,12 +53,34 @@ def verify(directory):
     attempts = rejected = rejected_tokens = unknown_usage = 0
     for decision in decisions:
         response = validate_response(decision['response'], decision['request']['questions'])
-        choice = response['answers']['action']['choice']
+        routing = decision.get('routing')
+        candidates = decision.get('candidates')
+        if routing is not None:
+            if not isinstance(candidates, dict) or routing != combat.graph_routing(candidates):
+                raise ValueError('Recorded graph routing differs from the candidate command categories')
+            questions = decision['request']['questions']
+            expected_questions = {routing['root_question']}
+            if set(questions[routing['root_question']]['criteria']) != set(routing['branches']):
+                raise ValueError('Recorded graph categories differ from the model question')
+            for branch in routing['branches'].values():
+                if branch['question'] is not None:
+                    expected_questions.add(branch['question'])
+                    if set(questions.get(branch['question'], {}).get('criteria', {})) != set(branch['candidate_ids']):
+                        raise ValueError('Recorded graph branch differs from the model action question')
+            if set(questions) != expected_questions:
+                raise ValueError('Recorded graph questions do not match the routed branches')
+            choice, child = combat.resolve_graph_choice(response, routing)
+            graph = decision['response'].get('metadata', {}).get('decision_graph', {})
+            if (graph.get('intent_question') != routing['root_question']
+                    or graph.get('selected_intent') != response['answers'][routing['root_question']]['choice']
+                    or graph.get('selected_action_question') != child or graph.get('selected_candidate') != choice):
+                raise ValueError('Recorded graph display does not match the model-selected path')
+        else:
+            choice = response['answers']['action']['choice']
         if choice != decision['selected']:
             raise ValueError('Executed selection differs from the recorded model choice')
-        candidates = decision.get('candidates')
         if candidates is not None or mission['kind'] == 'combat':
-            if (not isinstance(candidates, dict) or set(candidates) != set(decision['request']['questions']['action']['criteria'])
+            if (not isinstance(candidates, dict) or (routing is None and set(candidates) != set(decision['request']['questions']['action']['criteria']))
                     or decision.get('action') != candidates.get(choice)):
                 raise ValueError('Recorded command differs from the model-selected candidate')
         models.add(response['model'])

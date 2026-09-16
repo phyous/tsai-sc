@@ -273,6 +273,25 @@ def compose_frame(record: dict, game: Image.Image, *, speed: float = 4, test_onl
     metadata = decision.get("metadata") or {}
     if not isinstance(metadata, dict):
         raise RenderError("Recorded decision metadata must be an object.")
+    all_groups = groups
+    graph = metadata.get('decision_graph')
+    if graph is not None:
+        if not isinstance(graph, dict):
+            raise RenderError('Recorded decision graph is malformed.')
+        by_name = dict(groups)
+        root_name, child_name = graph.get('intent_question'), graph.get('selected_action_question')
+        selected_intent = graph.get('selected_intent')
+        expected_child = 'action_' + selected_intent.lower() if isinstance(selected_intent, str) else None
+        if (root_name not in by_name or by_name[root_name]['choice'] != graph.get('selected_intent')
+                or not isinstance(graph.get('selected_candidate'), str) or not graph['selected_candidate']
+                or (child_name is None and expected_child in by_name)
+                or (child_name is not None and child_name != expected_child)
+                or (child_name is not None and (child_name not in by_name
+                    or by_name[child_name]['choice'] != graph.get('selected_candidate')))):
+            raise RenderError('Recorded graph does not agree with its model choices.')
+        groups = [(root_name, by_name[root_name])]
+        if child_name is not None:
+            groups.append((child_name, by_name[child_name]))
     canvas = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
     draw = ImageDraw.Draw(canvas)
     draw.rectangle((0, 0, WIDTH, 5), fill=GREEN)
@@ -315,7 +334,7 @@ def compose_frame(record: dict, game: Image.Image, *, speed: float = 4, test_onl
     _text(draw, (1048, 242), decision_caption, 14, MUTED)
     rounded = [math.fsum(answer['probabilities'].values()) for _, answer in groups
                if not math.isclose(math.fsum(answer['probabilities'].values()), 1, abs_tol=1e-6, rel_tol=0)]
-    caption = f"API total {rounded[0]:.0%} (rounded; values shown unchanged)" if rounded else "Action choices, not a prediction of winning"
+    caption = f"API total {rounded[0]:.0%} (rounded; values shown unchanged)" if rounded else ("Independent choices · selected branch shown · not win odds" if graph else "Action choices, not a prediction of winning")
     _text(draw, (1048, 265), caption, 12, MUTED)
 
     shown = groups[:3]
@@ -326,7 +345,8 @@ def compose_frame(record: dict, game: Image.Image, *, speed: float = 4, test_onl
     for index, (name, answer) in enumerate(shown):
         group_height = area_height // len(shown)
         y = area_top + index * group_height
-        heading = _fit(draw, name.replace("_", " ").upper(), 330, 16)
+        heading_text = ('1. COMMAND CATEGORY' if name == graph.get('intent_question') else '2. ' + name.replace('action_', '').upper() + ' ACTION') if graph else name.replace("_", " ").upper()
+        heading = _fit(draw, heading_text, 330, 16)
         _text(draw, (1048, y), heading, 16)
         _text(draw, (1400, y + 1), f"conf {answer['confidence']:.2f}", 14, MUTED, True)
         max_options = max(2, min(5, (group_height - 40) // 31))
@@ -348,7 +368,11 @@ def compose_frame(record: dict, game: Image.Image, *, speed: float = 4, test_onl
         _text(draw, (1048, 523), "OBSERVED FORCE", 13, MUTED, True)
         _text(draw, (1048, 548), f"{_resource(combat, 'own_marines')} Marines  ·  {_resource(combat, 'own_firebats')} Firebats  ·  {_resource(combat, 'own_ghosts')} Ghosts", 18)
         _text(draw, (1048, 585), f"Visible hostile units: {_resource(combat, 'visible_enemy_units')}", 17, MUTED)
-    if len(groups) > 3:
+    if graph:
+        other = len(all_groups) - len(groups)
+        note = f"{other} unselected branch question(s) retained in trace" if other else "Selected category has one available action; no second probability" if len(groups) == 1 else "Returned values shown separately; no probability multiplication"
+        _text(draw, (1048, 671), note, 12, MUTED)
+    elif len(groups) > 3:
         _text(draw, (1048, 671), f"{len(groups) - 3} additional question(s) preserved in trace", 12, MUTED)
 
     draw.line((1048, 697, 1544, 697), fill=BORDER, width=1)
@@ -363,7 +387,7 @@ def compose_frame(record: dict, game: Image.Image, *, speed: float = 4, test_onl
 
     _text(draw, (32, 851), "OBJECTIVE", 12, MUTED, True)
     _text(draw, (145, 846), _fit(draw, _objective(state), 847, 18), 18)
-    for index, label in enumerate(("STATE", "JEV", "ORDERS")):
+    for index, label in enumerate(("STATE", "CATEGORY", "ACTION") if graph else ("STATE", "JEV", "ORDERS")):
         x = 1024 + index * 190
         draw.rounded_rectangle((x, 850, x + 156, 883), radius=5, outline=GREEN if index == 1 else BORDER)
         _text(draw, (x + 18, 857), label, 14, GREEN if index == 1 else MUTED, True)

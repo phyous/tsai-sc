@@ -6,7 +6,7 @@ import unittest
 
 from tsai_sc.combat import (
     CombatKind, CombatStateError, KnownRegion, MissionConfig, STRONGARM,
-    candidates, request_for,
+    candidates, graph_request_for, graph_routing, request_for, resolve_graph_choice,
 )
 
 
@@ -271,6 +271,123 @@ class CombatTests(unittest.TestCase):
             with self.subTest(order=order):
                 observed["units"][3]["order_id"] = order
                 self.assertTrue(any(action["kind"] == "gather" for action in candidates(observed).values()))
+
+
+class GraphTests(unittest.TestCase):
+    def setUp(self):
+        self.observed = state()
+        self.observed["units"].extend([unit(20, owner=0, x=560, y=420),
+                                       unit(30, 111, x=700, y=320, name="Barracks"),
+                                       unit(31, 176, owner=11, x=250, y=250, hp=100000, name="Mineral Field"),
+                                       unit(5, x=1100, y=500)])
+        self.actions = candidates(self.observed)
+        self.model, self.questions, self.routing = graph_request_for(self.observed, self.actions)
+
+    def response(self, intent):
+        answers = {}
+        for question_id, question in self.questions.items():
+            ids = list(question["criteria"])
+            answers[question_id] = {"type": "choice", "choice": intent if question_id == "intent" else ids[-1],
+                                    "probabilities": {key: 1 / len(ids) for key in ids}, "confidence": 0}
+        return {"answers": answers}
+
+    def test_graph_preserves_flat_validated_state_and_partitions_every_actual_command_once(self):
+        self.assertEqual(self.model, request_for(self.observed, self.actions)[0])
+        self.assertEqual(set(self.routing["branches"]), {"Economy", "Engage", "Explore", "Reposition", "Continue"})
+        self.assertEqual(self.routing, graph_routing(self.actions))
+        ids = [key for branch in self.routing["branches"].values() for key in branch["candidate_ids"]]
+        self.assertEqual(set(ids), set(self.actions))
+        self.assertEqual(len(ids), len(self.actions))
+        self.assertEqual(set(self.questions["intent"]["criteria"]), set(self.routing["branches"]))
+        for category, branch in self.routing["branches"].items():
+            if branch["question"] is not None:
+                question = self.questions[branch["question"]]
+                self.assertEqual(set(question["criteria"]), set(branch["candidate_ids"]))
+                self.assertIn("independent recommendation", question["instructions"])
+                for key, description in question["criteria"].items():
+                    self.assertEqual(description, self.actions[key]["label"])
+        self.assertIn("No joint probability", self.routing["semantics"])
+
+    def test_empty_categories_are_absent_and_singletons_have_no_child_question(self):
+        observed = state()
+        _, questions, routing = graph_request_for(observed, candidates(observed))
+        self.assertNotIn("Engage", routing["branches"])
+        self.assertNotIn("Reposition", routing["branches"])
+        self.assertEqual(routing["branches"]["Economy"], {"question": None, "candidate_ids": ["Train SCV"]})
+        self.assertNotIn("action_economy", questions)
+        self.assertNotIn("action_continue", questions)
+        self.assertIn("Idle/guard units remain idle", questions["intent"]["criteria"]["Continue"])
+
+    def test_route_uses_selected_intent_then_exact_child_and_preserves_probabilities(self):
+        response = self.response("Economy")
+        before = copy.deepcopy(response)
+        selected, child = resolve_graph_choice(response, self.routing)
+        self.assertEqual(child, "action_economy")
+        self.assertEqual(selected, response["answers"]["action_economy"]["choice"])
+        self.assertIn(selected, self.routing["branches"]["Economy"]["candidate_ids"])
+        self.assertEqual(response, before)
+
+    def test_singleton_route_uses_only_model_intent_without_synthetic_probability(self):
+        response = self.response("Continue")
+        before = copy.deepcopy(response)
+        self.assertEqual(resolve_graph_choice(response, self.routing), ("Continue current orders", None))
+        self.assertEqual(response, before)
+
+    def test_wrong_root_child_or_answer_option_sets_fail_closed(self):
+        invalid = []
+        response = self.response("Economy")
+        response["answers"]["intent"]["choice"] = "Win"
+        invalid.append(response)
+        response = self.response("Economy")
+        response["answers"]["action_economy"]["choice"] = "Continue current orders"
+        invalid.append(response)
+        response = self.response("Economy")
+        response["answers"]["action_economy"]["probabilities"]["Continue current orders"] = 0
+        invalid.append(response)
+        response = self.response("Economy")
+        del response["answers"]["action_explore"]
+        invalid.append(response)
+        response = self.response("Economy")
+        response["answers"]["intent"]["probabilities"].pop("Engage")
+        invalid.append(response)
+        for response in invalid:
+            with self.subTest(response=response), self.assertRaises(CombatStateError):
+                resolve_graph_choice(response, self.routing)
+
+    def test_malformed_duplicate_and_singleton_routing_fail_closed(self):
+        invalid = []
+        routing = copy.deepcopy(self.routing)
+        routing["version"] = True
+        invalid.append(routing)
+        routing = copy.deepcopy(self.routing)
+        routing["branches"]["Continue"]["question"] = "action_continue"
+        invalid.append(routing)
+        routing = copy.deepcopy(self.routing)
+        routing["branches"]["Economy"]["question"] = None
+        invalid.append(routing)
+        routing = copy.deepcopy(self.routing)
+        routing["branches"]["Economy"]["candidate_ids"].append("Continue current orders")
+        invalid.append(routing)
+        routing = copy.deepcopy(self.routing)
+        routing["branches"]["Economy"]["candidate_ids"] = []
+        invalid.append(routing)
+        for routing in invalid:
+            with self.subTest(routing=routing), self.assertRaises(CombatStateError):
+                resolve_graph_choice(self.response("Economy"), routing)
+
+    def test_routing_rejects_unknown_action_kinds_and_missing_intent_choice(self):
+        actions = copy.deepcopy(self.actions)
+        actions["Injected"] = {"kind": "declare_victory"}
+        with self.assertRaises(CombatStateError):
+            graph_routing(actions)
+        only_economy = {key: value for key, value in self.actions.items() if value["kind"] in {"gather", "train", "build"}}
+        with self.assertRaises(CombatStateError):
+            graph_routing(only_economy)
+
+    def test_graph_keeps_hidden_enemy_locations_out_of_every_question_and_route(self):
+        baseline = (self.model, self.questions, self.routing)
+        self.observed["units"].append(unit(900, owner=0, x=2789, y=1837, visible=False))
+        self.assertEqual(graph_request_for(self.observed, candidates(self.observed)), baseline)
 
 
 if __name__ == "__main__":

@@ -47,6 +47,104 @@ def make_run(root, records):
     return game
 
 
+def graph_record():
+    item = record()
+    item['state'].update(mission='Strongarm', objective_summary='TEST: Destroy the rebel base')
+    item['decision']['answers'] = {
+        # Unselected answers deliberately precede the selected path and have
+        # larger probabilities; neither insertion order nor argmax may route it.
+        'action_economy': {'type': 'choice', 'choice': 'Train Marine',
+                           'probabilities': {'Train Marine': 0.99, 'Gather minerals': 0.01}, 'confidence': 0.98},
+        'action_explore': {'type': 'choice', 'choice': 'Scout east',
+                           'probabilities': {'Scout east': 0.6, 'Scout west': 0.4}, 'confidence': 0.2},
+        'intent': {'type': 'choice', 'choice': 'Explore',
+                   'probabilities': {'Explore': 0.7, 'Economy': 0.2, 'Continue': 0.1}, 'confidence': 0.55},
+    }
+    item['decision']['metadata']['decision_graph'] = {
+        'intent_question': 'intent', 'selected_intent': 'Explore',
+        'selected_action_question': 'action_explore', 'selected_candidate': 'Scout east',
+    }
+    item['action'] = {'label': 'TEST: scout east'}
+    return item
+
+
+class GraphOverlayTests(unittest.TestCase):
+    def draw_labels(self, item):
+        import tsai_sc.render as module
+        game = Image.new('RGB', (640, 480), '#253b31')
+        ImageDraw.Draw(game).text((160, 220), 'TEST graph fixture', fill='white')
+        with patch('tsai_sc.render._text', wraps=module._text) as draw_text:
+            image = compose_frame(item, game, test_only=True)
+        self.assertEqual(image.size, (1600, 900))
+        return [str(call.args[2]) for call in draw_text.call_args_list]
+
+    def test_selected_intent_and_matching_child_are_displayed_separately(self):
+        item = graph_record()
+        original = copy.deepcopy(item)
+        labels = self.draw_labels(item)
+        self.assertIn('1. COMMAND CATEGORY', labels)
+        self.assertIn('2. EXPLORE ACTION', labels)
+        self.assertIn('Scout east', labels)
+        self.assertIn('70%', labels)
+        self.assertIn('60%', labels)
+        self.assertNotIn('42%', labels)  # Never multiply independent judgments.
+        self.assertIn('TEST: scout east', labels)
+        self.assertEqual(item, original)
+
+    def test_unselected_branch_is_retained_but_not_displayed_as_an_order(self):
+        item = graph_record()
+        labels = self.draw_labels(item)
+        self.assertNotIn('2. ECONOMY ACTION', labels)
+        self.assertNotIn('Train Marine', labels)
+        self.assertNotIn('99%', labels)
+        self.assertIn('1 unselected branch question(s) retained in trace', labels)
+        self.assertIn('action_economy', item['decision']['answers'])
+        self.assertNotIn('EXECUTED ORDER', labels)
+
+    def test_singleton_path_has_only_actual_intent_probabilities(self):
+        item = graph_record()
+        item['decision']['answers']['intent'].update(
+            choice='Continue', probabilities={'Continue': 0.8, 'Explore': 0.15, 'Economy': 0.05})
+        item['decision']['metadata']['decision_graph'].update(
+            selected_intent='Continue', selected_action_question=None, selected_candidate='Continue current orders')
+        item['action'] = {'label': 'TEST: continue current orders'}
+        original = copy.deepcopy(item)
+        labels = self.draw_labels(item)
+        self.assertIn('1. COMMAND CATEGORY', labels)
+        self.assertFalse(any(label.startswith('2. ') for label in labels))
+        self.assertIn('80%', labels)
+        self.assertNotIn('100%', labels)
+        self.assertNotIn('60%', labels)
+        self.assertNotIn('99%', labels)
+        self.assertIn('TEST: continue current orders', labels)
+        self.assertEqual(item, original)
+
+    def test_inconsistent_path_metadata_is_rejected(self):
+        mutations = {
+            'wrong intent': {'selected_intent': 'Economy'},
+            'missing root': {'intent_question': 'missing'},
+            'missing child': {'selected_action_question': 'missing'},
+            'wrong candidate': {'selected_candidate': 'Scout west'},
+            'coherent wrong branch': {'selected_action_question': 'action_economy', 'selected_candidate': 'Train Marine'},
+            'omitted nonsingleton child': {'selected_action_question': None},
+        }
+        for name, changes in mutations.items():
+            item = graph_record()
+            item['decision']['metadata']['decision_graph'].update(changes)
+            with self.subTest(name=name), self.assertRaises(RenderError):
+                self.draw_labels(item)
+
+    def test_singleton_path_requires_a_concrete_candidate_label(self):
+        for candidate in ('', None):
+            item = graph_record()
+            item['decision']['answers']['intent'].update(
+                choice='Continue', probabilities={'Continue': 0.8, 'Explore': 0.15, 'Economy': 0.05})
+            item['decision']['metadata']['decision_graph'].update(
+                selected_intent='Continue', selected_action_question=None, selected_candidate=candidate)
+            with self.subTest(candidate=candidate), self.assertRaises(RenderError):
+                self.draw_labels(item)
+
+
 class TimelineTests(unittest.TestCase):
     def test_timing_uses_elapsed_differences_and_speed(self):
         records = [record(2), record(6), record(14, "victory")]

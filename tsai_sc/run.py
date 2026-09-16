@@ -32,6 +32,27 @@ class Recorder:
         self.state = {}
         self.decision = None
         self.action = {'label': 'Observing original StarCraft mission'}
+        self.blank_since = None
+
+    def _check_capture(self, path, now):
+        """Stop unusable gameplay recordings while allowing brief transitions."""
+        from PIL import Image
+        try:
+            with Image.open(path) as captured:
+                if captured.format != 'PNG' or captured.size != (640, 480):
+                    raise RuntimeError('Recording requires an original 640x480 PNG game canvas')
+                blank = captured.convert('RGB').getbbox() is None
+        except (OSError, Image.DecompressionBombError):
+            raise RuntimeError('Unable to decode the recorded game canvas') from None
+        if not blank:
+            self.blank_since = None
+            return
+        if self.index == 0:
+            raise RuntimeError('The first gameplay capture is blank; repair capture before making model requests')
+        if self.blank_since is None:
+            self.blank_since = now
+        elif now - self.blank_since >= 2:
+            raise RuntimeError('Gameplay captures stayed blank for two seconds; recording stopped')
 
     def frame(self, force=False, status='running'):
         now = time.monotonic() - self.start
@@ -39,6 +60,7 @@ class Recorder:
             return
         filename = f'frames/{self.index:06d}.png'
         self.bridge.capture(self.directory / filename)
+        self._check_capture(self.directory / filename, now)
         public_state = {k: self.state[k] for k in ('mission', 'mission_kind', 'objective_summary', 'combat', 'frame', 'minerals', 'gas', 'supply', 'objective_progress') if k in self.state}
         row = {'t': now, 'frame': filename, 'state': public_state, 'decision': self.decision,
                'action': self.action, 'status': status}
@@ -71,7 +93,7 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
         'model_requested': 'jev-latest', 'initial_state': initial,
         'pacing': 'Game paused for consistent memory snapshots and model inference; ordinary game input between snapshots.',
         'observation': 'Read-only own/visible unit state, resources and original mission outcome',
-        'controller': 'Jev selects one candidate; deterministic worker/target/placement/input adapter',
+        'controller': 'Jev selects a command category and its action in parallel Choice questions; deterministic graph routing and mouse/keyboard adapter',
         'max_requests': max_requests, 'max_seconds': max_seconds, 'capture_fps': capture_fps,
         'decision_seconds': decision_seconds,
         'source_sha256': {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -116,11 +138,23 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
                 is_combat = state.get('mission_kind') == 'combat'
                 actions = combat.candidates(state, combat.STRONGARM, history) if is_combat else candidates(state)
                 if len(actions) > 1:
-                    model_state, questions = (combat.request_for(state, actions, history, combat.STRONGARM)
-                                              if is_combat else request_for(state, actions, history))
+                    routing = None
+                    if is_combat:
+                        model_state, questions, routing = combat.graph_request_for(state, actions, history, combat.STRONGARM)
+                    else:
+                        model_state, questions = request_for(state, actions, history)
                     write_json(recorder.directory / 'pending-request.json', {'state': model_state, 'questions': questions})
                     response = client.evaluate(model_state, questions)
-                    choice = response['answers']['action']['choice']
+                    choice, child_question = (combat.resolve_graph_choice(response, routing) if routing else
+                                              (response['answers']['action']['choice'], 'action'))
+                    if routing:
+                        response['metadata']['decision_graph'] = {
+                            'intent_question': routing['root_question'],
+                            'selected_intent': response['answers'][routing['root_question']]['choice'],
+                            'selected_action_question': child_question,
+                            'selected_candidate': choice,
+                            'semantics': 'Independent questions evaluated in one request; selected branch routes to its action. Values are not multiplied.',
+                        }
                     selected = actions[choice]
                     recorder.decision, recorder.action = response, selected
                     model_calls += 1
@@ -145,13 +179,22 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
                              'input_result': issued, 'command_verification': verified,
                              'after': {'frame': after['frame'], 'minerals': after['minerals'], 'gas': after['gas'],
                                        'workers': [u for u in after['units'] if u['type_id'] == 7 and u['owner'] == after['player_id']]}}
+                    if routing:
+                        event['routing'] = routing
                     decisions.write(json.dumps(event, separators=(',', ':')) + '\n')
                     decisions.flush()
                     history.append({'command': selected['label'], 'kind': selected['kind'], 'squad': selected.get('squad'), 'point': selected.get('point'),
                                     'units': executed.get('units', [executed['unit']] if 'unit' in executed else []),
                                     'squad_centers': [{'name': squad['name'], **squad['center']} for squad in model_state.get('squads', [])],
                                     'frame': state['frame'], 'accepted': verified['accepted'], 'minerals_after': after['minerals'], 'gas_after': after['gas']})
-                    print(f'call={model_calls} frame={state["frame"]} minerals={state["minerals"]} gas={state["gas"]} choice={choice} probability={response["answers"]["action"]["probabilities"][choice]:.3f}', flush=True)
+                    if routing:
+                        intent = response['answers'][routing['root_question']]
+                        child = response['answers'].get(child_question) if child_question else None
+                        probability = f'{child["probabilities"][choice]:.3f}' if child else 'single available action'
+                        probability_text = f'intent={intent["choice"]} intent_probability={intent["probabilities"][intent["choice"]]:.3f} branch_probability={probability}'
+                    else:
+                        probability_text = f'probability={response["answers"]["action"]["probabilities"][choice]:.3f}'
+                    print(f'call={model_calls} frame={state["frame"]} minerals={state["minerals"]} gas={state["gas"]} choice={choice} {probability_text}', flush=True)
                 else:
                     recorder.action = {'label': 'Current orders continue; no new command available'}
                 bridge.resume()

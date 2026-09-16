@@ -494,3 +494,112 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
                 "Idle/guard units remain idle; no new mining, production or scouting begins."
             )
     return model_state, questions
+
+
+_INTENT_KINDS = {
+    "Economy": {"gather", "train", "build"},
+    "Engage": {"attack_target", "attack_move"},
+    "Explore": {"explore"},
+    "Reposition": {"retreat", "regroup"},
+    "Continue": {"continue"},
+}
+_GRAPH_SEMANTICS = "Independent parallel judgments; intent selects a branch, then its selected concrete command. No joint probability is inferred."
+
+
+def graph_routing(actions: dict[str, CombatAction]) -> dict:
+    """Reconstruct the complete route map from exact candidate IDs and kinds."""
+    if (not isinstance(actions, dict) or not 2 <= len(actions) <= 255
+            or any(not isinstance(key, str) or not key or not isinstance(action, dict)
+                   or action.get("kind") not in set().union(*_INTENT_KINDS.values()) for key, action in actions.items())):
+        raise CombatStateError("Invalid candidates for intent graph routing.")
+    routing = {"version": 1, "root_question": "intent", "branches": {}, "semantics": _GRAPH_SEMANTICS}
+    for category, kinds in _INTENT_KINDS.items():
+        candidate_ids = [key for key, action in actions.items() if action["kind"] in kinds]
+        if candidate_ids:
+            question_id = "action_" + category.lower() if len(candidate_ids) >= 2 else None
+            routing["branches"][category] = {"question": question_id, "candidate_ids": candidate_ids}
+    if len(routing["branches"]) < 2:
+        raise CombatStateError("An intent graph requires at least two available command categories.")
+    return routing
+
+
+def graph_request_for(state: dict, actions: dict[str, CombatAction], history: list[dict] | None = None,
+                      mission: MissionConfig = STRONGARM) -> tuple[dict, dict, dict]:
+    """Batch an intent Choice and speculative per-intent command Choices.
+
+    All questions see the same validated state, independently. Routing happens in
+    the harness after the response; child questions never see the intent answer.
+    A singleton branch needs no child inference. Its only command is selected
+    through Jev's intent answer, without inventing another probability.
+    """
+    model_state, flat_questions = request_for(state, actions, history, mission)
+    descriptions = {
+        "Economy": "Issue a worker, production, or supply command. Existing military orders continue independently.",
+        "Engage": "Issue a squad attack against a currently visible hostile target or toward an explicitly known objective.",
+        "Explore": "Issue a squad attack-move to reveal terrain and look for remaining hostile forces or the rebel base.",
+        "Reposition": "Move a squad to regroup or retreat; ordinary movement can interrupt firing or an advance.",
+        "Continue": "Issue no new command; preserve only the currently observed activities.",
+    }
+    questions = {"intent": {
+        "type": "choice",
+        "instructions": "Choose which kind of gameplay command would make the most useful progress toward completing the mission from the CURRENT observed state. Compare the best available command in each category, regardless of how many commands it contains. Consider threats, force health, exploration, current mineral income and production. Current standing-guard units are idle; Continue starts no new activity. Existing economic work may continue while a military command is issued, and vice versa. Select the category now; independent companion questions recommend concrete commands within each category.",
+        "criteria": {},
+    }}
+    routing = graph_routing(actions)
+    flat_criteria = flat_questions["action"]["criteria"]
+    for category, branch in routing["branches"].items():
+        candidate_ids, question_id = branch["candidate_ids"], branch["question"]
+        description = descriptions[category]
+        if category == "Continue":
+            description = flat_criteria[candidate_ids[0]]
+        questions["intent"]["criteria"][category] = description + " Available commands: " + "; ".join(candidate_ids)
+        if question_id is not None:
+            questions[question_id] = {
+                "type": "choice",
+                "instructions": f"Assuming a {category.lower()} command is to be issued, choose the available concrete command that best advances the mission from the current observations. This is an independent recommendation, used only if the separate intent decision selects {category}. Compare actual actors, targets, health, current orders, resources, and previously observed positions. Avoid reversing a productive advance without a tactical reason; unknown enemy locations remain unknown. Choose one of these actual gameplay commands.",
+                "criteria": {key: flat_criteria[key] for key in candidate_ids},
+            }
+    return model_state, questions, routing
+
+
+def resolve_graph_choice(response: dict, routing: dict) -> tuple[str, str | None]:
+    """Route a client-validated response without changing any probabilities.
+
+    This verifies graph identity and exact answer/candidate sets. The API client
+    remains responsible for numerical probability and response validation.
+    Audit tools should reconstruct the routing from the recorded candidate map.
+    """
+    if (not isinstance(routing, dict) or set(routing) != {"version", "root_question", "branches", "semantics"}
+            or type(routing["version"]) is not int or routing["version"] != 1
+            or routing["root_question"] != "intent" or routing["semantics"] != _GRAPH_SEMANTICS):
+        raise CombatStateError("Invalid intent graph routing metadata.")
+    branches = routing["branches"]
+    if not isinstance(branches, dict) or not 2 <= len(branches) <= len(_INTENT_KINDS) or not set(branches) <= set(_INTENT_KINDS):
+        raise CombatStateError("Invalid intent graph branches.")
+    expected_answers = {"intent": set(branches)}
+    seen_candidates = set()
+    for category, branch in branches.items():
+        if not isinstance(branch, dict) or set(branch) != {"question", "candidate_ids"}:
+            raise CombatStateError("Invalid intent graph branch metadata.")
+        ids = branch["candidate_ids"]
+        if (not isinstance(ids, list) or not ids or any(not isinstance(key, str) or not key for key in ids)
+                or len(ids) != len(set(ids)) or seen_candidates.intersection(ids)):
+            raise CombatStateError("Graph branches require distinct concrete candidate IDs.")
+        seen_candidates.update(ids)
+        expected_question = "action_" + category.lower() if len(ids) >= 2 else None
+        if branch["question"] != expected_question:
+            raise CombatStateError("Graph child question does not match its singleton or multi-command branch.")
+        if expected_question is not None:
+            expected_answers[expected_question] = set(ids)
+    answers = response.get("answers") if isinstance(response, dict) else None
+    if not isinstance(answers, dict) or set(answers) != set(expected_answers):
+        raise CombatStateError("Graph response question IDs do not match the routing.")
+    for question_id, expected_ids in expected_answers.items():
+        answer = answers[question_id]
+        if (not isinstance(answer, dict) or answer.get("type") != "choice"
+                or not isinstance(answer.get("choice"), str) or answer["choice"] not in expected_ids
+                or not isinstance(answer.get("probabilities"), dict) or set(answer["probabilities"]) != expected_ids):
+            raise CombatStateError("Graph answer choices do not match their exact candidate IDs.")
+    branch = branches[answers["intent"]["choice"]]
+    child_question = branch["question"]
+    return (answers[child_question]["choice"] if child_question is not None else branch["candidate_ids"][0]), child_question

@@ -88,16 +88,27 @@ Own units + visible enemies/resources + economy + recent observed positions
           ↓
 Bounded candidate commands and recent execution feedback
           ↓
-TypeSafe Jev: selected command + complete probability distribution
+TypeSafe Jev: category + per-category command distributions
           ↓
 Deterministic selection / camera / mouse / hotkey adapter
           ↓
 Original StarCraft simulation and mission triggers
 ```
 
-Each API request presents one finite Choice question. Its options are the exact
-available commands at that moment; the visualizer displays the returned
-probability distribution over those options.
+Each combat request evaluates a small decision graph. An `intent` Choice selects
+among the available **Economy, Engage, Explore, Reposition, and Continue**
+categories. Independent `action_<category>` Choice questions choose concrete
+commands within each category. The API evaluates those questions together from
+the same observation; code routes the selected category to its selected command.
+A category with one available command needs no second model question.
+
+The visualizer shows the actual category distribution and the selected branch's
+action distribution separately. It never multiplies them into a claimed API
+probability. Other branch answers remain in the log. This avoids splitting one
+category's support across many concrete options in a single flat comparison.
+All questions in a request are independent: a judgment that depends on another
+answer would instead require a later request, as described in the
+[TypeSafe API documentation](https://docs.typesafe.ai/primitives#when-one-question-depends-on-another).
 
 | Model choice | Candidate supplied by the harness | Original game controls |
 | --- | --- | --- |
@@ -123,7 +134,7 @@ at seventy-two, with one queued unit per producer. Depots are offered near the
 supply limit, with one unfinished depot at a time. Workers inside refineries,
 unfinished units, and workers already constructing cannot be retasked through
 these options. This action-space design is part of the experiment: Jev selects
-among supplied commands, and the adapter translates that selection into input.
+a category and its supplied command, and the adapter translates that selection into input.
 
 The adapter records dispatch, actual selected units, and observed order acceptance
 separately. Acceptance is evidence of an order in progress, not proof of arrival
@@ -157,7 +168,9 @@ is presented as a visible victory.
 The video shows **action probabilities**, not estimated chances of winning. It
 labels playback speed and decision pauses. Model probabilities are preserved
 unchanged. Frames contain only the 640×480 game canvas, with an independently
-rendered dashboard. No desktop, login screen, microphone, or API key is recorded.
+rendered dashboard. No desktop, login screen, microphone, or API key is recorded. The recorder rejects
+a blank first gameplay frame and stops on sustained black captures, such as a
+lost browser GPU device.
 
 Observed API compatibility issue: some large Choice replies from `jev-1.13.0`
 return every option but round values to whole percentage points totaling 99%.

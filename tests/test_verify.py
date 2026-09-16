@@ -11,6 +11,7 @@ import unittest
 from PIL import Image, ImageDraw
 
 from tsai_sc.verify import verify
+from tsai_sc.combat import graph_routing
 
 
 class VerificationTests(unittest.TestCase):
@@ -167,6 +168,70 @@ class VerificationTests(unittest.TestCase):
         self.result.pop('visible_victory_frame_sha256')
         self.write_result()
         with self.assertRaisesRegex(ValueError, 'image hash differs'):
+            verify(self.root)
+
+    def test_black_victory_image_is_rejected_even_with_matching_hash(self):
+        self.strongarm()
+        path = self.root / 'frames/TEST.png'
+        Image.new('RGB', (640, 480), 'black').save(path)
+        self.result['visible_victory_frame_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+        self.write_result()
+        with self.assertRaisesRegex(ValueError, 'nonblank'):
+            verify(self.root)
+
+    def graph_fixture(self):
+        self.strongarm()
+        decision = self.decisions[0]
+        decision['candidates'] = {'mine': {'kind': 'gather'}, 'east': {'kind': 'explore'},
+                                  'south': {'kind': 'explore'}, 'wait': {'kind': 'continue'}}
+        routing = graph_routing(decision['candidates'])
+        decision['routing'] = routing
+        questions = {'intent': {'type': 'choice', 'instructions': 'TEST: choose category.',
+                               'criteria': {key: key for key in routing['branches']}},
+                     'action_explore': {'type': 'choice', 'instructions': 'TEST: choose direction.',
+                                        'criteria': {'east': 'Go east', 'south': 'Go south'}}}
+        decision['request']['questions'] = questions
+        decision['response']['answers'] = {
+            'intent': {'type': 'choice', 'choice': 'Explore', 'confidence': .7,
+                       'probabilities': {'Economy': .2, 'Explore': .7, 'Continue': .1}},
+            'action_explore': {'type': 'choice', 'choice': 'south', 'confidence': .8,
+                               'probabilities': {'east': .1, 'south': .9}},
+        }
+        decision['response']['metadata']['decision_graph'] = {
+            'intent_question': 'intent', 'selected_intent': 'Explore',
+            'selected_action_question': 'action_explore', 'selected_candidate': 'south',
+        }
+        decision['selected'] = 'south'
+        decision['action'] = decision['candidates']['south'].copy()
+        self.write_logs()
+        return decision
+
+    def test_graph_selected_branch_binds_execution_and_display(self):
+        decision = self.graph_fixture()
+        self.assertEqual(verify(self.root)['model_calls'], 1)
+        decision['selected'] = 'mine'
+        self.write_logs()
+        with self.assertRaisesRegex(ValueError, 'selection differs'):
+            verify(self.root)
+        decision['selected'] = 'south'
+        decision['response']['metadata']['decision_graph']['selected_intent'] = 'Economy'
+        self.write_logs()
+        with self.assertRaisesRegex(ValueError, 'display does not match'):
+            verify(self.root)
+
+    def test_graph_cannot_reroute_candidates_or_replace_question_keys(self):
+        decision = self.graph_fixture()
+        decision['routing']['branches']['Economy']['candidate_ids'] = ['south']
+        self.write_logs()
+        with self.assertRaisesRegex(ValueError, 'routing differs'):
+            verify(self.root)
+        decision = self.graph_fixture()
+        decision['request']['questions']['intent']['criteria']['Explore'] = 'Explore'
+        # A matching forged API reply still cannot silently drop a candidate.
+        decision['request']['questions']['action_explore']['criteria'] = {'west': 'West', 'south': 'South'}
+        decision['response']['answers']['action_explore']['probabilities'] = {'west': .1, 'south': .9}
+        self.write_logs()
+        with self.assertRaisesRegex(ValueError, 'branch differs'):
             verify(self.root)
 
     def test_ordinary_modifier_key_input_is_allowed(self):
