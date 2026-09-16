@@ -1,10 +1,11 @@
 """Behavior checks for legal command menus and the original input path."""
 import copy
+import itertools
 import struct
 import unittest
 from unittest.mock import patch
 
-from tsai_sc.controller import InputAdapter, candidates, depot_sites, request_for, supply, verify_command
+from tsai_sc.controller import InputAdapter, building_sites, candidates, depot_sites, request_for, supply, verify_command
 from tsai_sc.game import CAMERA, UNIT_BASE, UNIT_SIZE, UNIT_NAMES
 
 
@@ -149,6 +150,37 @@ class ControllerTests(unittest.TestCase):
         blocked['units'].append(unit(6, 109, **points[0]))
         self.assertNotIn(points[0], depot_sites(blocked))
 
+    def test_barracks_centers_align_four_by_three_tile_footprint(self):
+        state = mission()
+        points = building_sites(state, 111)
+        self.assertTrue(points)
+        for point in points:
+            self.assertEqual((point['x'] - 64) % 32, 0)
+            self.assertEqual((point['y'] - 48) % 32, 0)
+            self.assertGreaterEqual(point['x'] - 64, 8)
+            self.assertGreaterEqual(point['y'] - 48, 8)
+            self.assertLessEqual(point['x'] + 64, state['map']['width_tiles'] * 32 - 8)
+            self.assertLessEqual(point['y'] + 48, state['map']['height_tiles'] * 32 - 8)
+
+    def test_building_sites_use_full_observed_building_footprints(self):
+        state = mission()
+        point = building_sites(state, 111)[0]
+        for type_id in (111, 122):
+            blocked = copy.deepcopy(state)
+            # The centers differ, but their128px-wide footprints overlap.
+            blocked['units'].append(unit(6, type_id, point['x'] + 120, point['y']))
+            self.assertNotIn(point, building_sites(blocked, 111))
+
+    def test_building_sites_use_own_base_and_ignore_hidden_enemy_locations(self):
+        state = mission()
+        original = building_sites(state, 111)
+        state['units'].append(unit(6, 111, **original[0], owner=0, visible=False))
+        self.assertEqual(building_sites(state, 111), original)
+        state['units'] = [u for u in state['units'] if u['type_id'] != 106]
+        self.assertEqual(building_sites(state, 111), [])
+        with self.assertRaises(ValueError):
+            building_sites(state, 110)
+
     def adapter(self, bridge):
         adapter = InputAdapter(bridge)
         adapter._settle = lambda *args: None
@@ -174,6 +206,19 @@ class ControllerTests(unittest.TestCase):
         self.assertNotIn(('clickHold', 320, 224, 100, 0), bridge.calls)
         self.assertIn(('keyHold', 'r', 60), bridge.calls)
         self.assertEqual(bridge.calls[-1], ('pause',))
+        self.assertFalse(bridge.running)
+
+    def test_barracks_uses_b_b_and_four_by_three_tile_upper_left(self):
+        bridge = Bridge()
+        state = mission()
+        state['units'][0].update(x=400, y=500)
+        action = {'kind': 'build', 'unit': 1, 'building': 111,
+                  'point': {'x': 320, 'y': 592}}
+        result = self.execute(self.adapter(bridge), state, action)
+        self.assertTrue(result['issued'])
+        self.assertEqual([call[1] for call in bridge.calls if call[0] == 'keyHold'], ['b', 'b'])
+        # center(320,592) - camera(0,384) - half footprint(64,48)
+        self.assertIn(('clickHold', 256, 160, 100, 0), bridge.calls)
         self.assertFalse(bridge.running)
 
     def test_gather_right_clicks_target_without_build_offset(self):
@@ -461,8 +506,15 @@ class TacticalControllerTests(unittest.TestCase):
         bridge = bridge or Bridge()
         adapter = InputAdapter(bridge)
         adapter._settle = lambda *args: None
-        reader = {'side_effect': snapshots} if snapshots is not None else {'return_value': state}
-        with patch('tsai_sc.controller.read_state', **reader), patch('tsai_sc.controller.read_selection', side_effect=[[], list(actual)]):
+        reader = {'side_effect': itertools.chain(snapshots, itertools.repeat(snapshots[-1]))} if snapshots is not None else {'return_value': state}
+        def observed_selection(_):
+            clicks = [call for call in bridge.calls if call[0] == 'clickHold' and call[2] < 348]
+            if not clicks:
+                return []
+            if len(clicks) == 1 and 1 in actual:
+                return [1]
+            return list(actual)
+        with patch('tsai_sc.controller.read_state', **reader), patch('tsai_sc.controller.read_selection', side_effect=observed_selection):
             result = adapter.execute(state, action)
         return result, bridge
 
@@ -480,6 +532,10 @@ class TacticalControllerTests(unittest.TestCase):
         self.assertFalse(any(call[0] == 'keyHold' and call[1] == 'escape' for call in bridge.calls))
         self.assertEqual(result['inputs'][-1], {'command': 'key', 'args': ['shift', {'up': True}]})
         self.assertEqual(result['selection_method'], 'shift_click')
+
+        selection_inputs = [(command, running) for command, running in bridge.input_running
+                            if command in {'clickHold', 'key'}]
+        self.assertEqual(selection_inputs[:3], [('clickHold', False), ('key', False), ('clickHold', False)])
 
     def test_exact_existing_selection_skips_clicks_and_modifier_presses(self):
         state = self.state()
@@ -503,11 +559,14 @@ class TacticalControllerTests(unittest.TestCase):
         bridge = Bridge()
         adapter = InputAdapter(bridge)
         adapter._settle = lambda *args: None
+        def selection(_):
+            return [1, 2] if any(call[0] == 'clickHold' for call in bridge.calls) else [1]
         with patch('tsai_sc.controller.read_state', return_value=state), \
-                patch('tsai_sc.controller.read_selection', side_effect=[[1], [1, 2]]):
+                patch('tsai_sc.controller.read_selection', side_effect=selection):
             result = adapter.execute(state, self.action())
         self.assertEqual(result['selection_method'], 'shift_click')
-        self.assertIn(('clickHold', 360, 136, 100, 0), bridge.calls)
+        self.assertIn(('clickHold', 360, 136, 1, 0), bridge.calls)
+        self.assertNotIn(('clickHold', 300, 116, 1, 0), bridge.calls)
 
     def test_exact_selection_still_requires_current_owned_visible_complete_units(self):
         state = self.state()
@@ -533,10 +592,34 @@ class TacticalControllerTests(unittest.TestCase):
                 self.assertFalse(any(call[0] == 'keyHold' for call in bridge.calls))
                 self.assertEqual(bridge.calls[-2:], [('key', 'shift', {'up': True}), ('pause',)])
 
-    def test_reported_squad_is_actual_selection_not_attempted_clicks(self):
-        result, _ = self.execute(self.state(), self.action(), actual=[1])
-        self.assertTrue(result['issued'])
+    def test_live_visible_requested_units_cannot_be_silently_omitted(self):
+        result, bridge = self.execute(self.state(), self.action(), actual=[1])
+        self.assertFalse(result['issued'])
         self.assertEqual(result['selected_units'], [1])
+        self.assertEqual(result['missing_units'], [2])
+        self.assertFalse(any(call[0] == 'keyHold' for call in bridge.calls))
+        self.assertEqual(sum(call == ('clickHold', 360, 136, 1, 0) for call in bridge.calls), 2)
+
+    def test_shift_is_queued_before_final_moving_actor_snapshot(self):
+        state = self.state()
+        bridge = Bridge()
+        adapter = InputAdapter(bridge)
+        adapter._settle = lambda *args: None
+        def snapshot(_):
+            self.assertFalse(bridge.running)
+            fresh = copy.deepcopy(state)
+            if ('key', 'shift', {'down': True}) in bridge.calls:
+                fresh['units'][1].update(x=420, y=530)
+            return fresh
+        def selection(_):
+            count = sum(call[0] == 'clickHold' for call in bridge.calls)
+            return [] if count == 0 else [1] if count == 1 else [1, 2]
+        with patch('tsai_sc.controller.read_state', side_effect=snapshot), \
+                patch('tsai_sc.controller.read_selection', side_effect=selection):
+            result = adapter.execute(state, self.action())
+        self.assertTrue(result['issued'])
+        self.assertIn(('clickHold', 420, 146, 1, 0), bridge.calls)
+        self.assertNotIn(('clickHold', 360, 136, 1, 0), bridge.calls)
 
     def test_unavailable_unit_after_camera_refresh_is_not_clicked(self):
         for change in ({'visible': False}, {'completed': False}, {'owner': 0}):

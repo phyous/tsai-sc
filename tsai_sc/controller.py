@@ -10,7 +10,8 @@ import struct
 import time
 from .game import CAMERA, game_to_screen, read_state, read_selection
 
-BUILDING_SIZE = {106: (128, 96), 109: (96, 64), 110: (128, 64)}
+BUILDING_SIZE = {106: (128, 96), 109: (96, 64), 110: (128, 64),
+                 111: (128, 96), 122: (128, 96)}
 IDLE = {1, 2, 3}
 BUILDING_ORDERS = {30, 33, 34, 35}
 GAS_ORDERS = {81, 82, 83, 84}
@@ -80,31 +81,46 @@ def verify_command(before, after, action):
     return {'accepted': accepted, 'evidence': 'Observed actor order and production state', 'actor_order_id': unit['order_id']}
 
 
-def depot_sites(state):
+def building_sites(state, building_id):
     """Offer open tile-aligned candidates; the original engine validates terrain.
 
     This is a compact placement heuristic, not a map hack: no terrain or game
     state is altered. Placement failures are recorded and fed back to Jev.
+    Points are footprint centers. A Barracks occupies four by three tiles, so
+    its center is aligned to x modulo32=0 and y modulo32=16.
     """
+    if building_id not in {109, 111}:
+        raise ValueError('Placement candidates support Supply Depots and Barracks')
+    width, height = BUILDING_SIZE[building_id]
     centers = own_units(state, 106)
     if not centers:
         return []
     cc = centers[0]
     result = []
     for dx, dy in [(176, 96), (304, 96), (176, 192), (304, 192), (-176, 160), (48, 224)]:
-        x = ((cc['x'] + dx) // 32) * 32 + 16
-        y = ((cc['y'] + dy) // 32) * 32
-        if not (64 <= x < state['map']['width_tiles'] * 32 - 64 and 64 <= y < state['map']['height_tiles'] * 32 - 64):
+        x = ((cc['x'] + dx) // 32) * 32 + (width // 2) % 32
+        y = ((cc['y'] + dy) // 32) * 32 + (height // 2) % 32
+        margin_x, margin_y = max(64, width // 2 + 8), max(64, height // 2 + 8)
+        if not (margin_x <= x < state['map']['width_tiles'] * 32 - margin_x and
+                margin_y <= y < state['map']['height_tiles'] * 32 - margin_y):
             continue
         blocked = False
         for unit in state['units']:
-            w, h = BUILDING_SIZE.get(unit['type_id'], (64, 64) if unit['type_id'] in {176, 177, 178, 188} else (24, 24))
-            if abs(unit['x'] - x) < (w + 96) / 2 + 8 and abs(unit['y'] - y) < (h + 64) / 2 + 8:
+            if unit['owner'] != state['player_id'] and unit.get('visible') is not True:
+                continue
+            w, h = BUILDING_SIZE.get(unit['type_id'], (64, 64) if unit['type_id'] in {176, 177, 178, 188} else
+                                     (128, 96) if 106 <= unit['type_id'] <= 173 else (24, 24))
+            if abs(unit['x'] - x) < (w + width) / 2 + 8 and abs(unit['y'] - y) < (h + height) / 2 + 8:
                 blocked = True
                 break
         if not blocked:
             result.append({'x': x, 'y': y})
     return result
+
+
+def depot_sites(state):
+    """Compatibility helper for the original tutorial/depot action menu."""
+    return building_sites(state, 109)
 
 
 def candidates(state):
@@ -202,11 +218,16 @@ class InputAdapter:
                 self.on_frame()
 
     def _input(self, command, *args):
+        result = self._queue_input(command, *args)
+        self._settle()
+        return result
+
+    def _queue_input(self, command, *args):
+        """Queue input without advancing a paused coordinate snapshot."""
         self.inputs.append({'command': command, 'args': list(args)})
         result = self.bridge.rpc(command, *args)
         if isinstance(result, dict) and result.get('ok') is False:
             raise RuntimeError('Original game input was rejected by the runtime')
-        self._settle()
         return result
 
     def camera(self):
@@ -231,49 +252,80 @@ class InputAdapter:
         raise CommandUnavailable('Camera did not expose the selected target; re-observe before issuing another command')
 
     def _select_squad(self, state, action):
-        """Reuse an exact current selection, otherwise select with Shift-clicks."""
+        """Select every available requested unit, checking each ordinary click.
+
+        Shift-down and the click are queued while paused. Refresh coordinates
+        after queuing Shift, then resume only after queuing the click. Selection
+        uses a1ms tap: the original UI handles queued mouse events, and a100ms
+        hold lets a moving unit leave the hit point before mouse-up selection.
+        """
         self.bridge.pause()
         actual = read_selection(self.bridge.read_memory)
         requested = set(action['units'])
-        if actual and set(actual) == requested:
+
+        def available_units(snapshot):
+            return {u['id']: u for u in snapshot['units'] if u['id'] in requested
+                    and u['owner'] == state['player_id'] and u['completed'] and u['visible']}
+
+        fresh = read_state(self.bridge.read_memory)
+        available = available_units(fresh)
+        if actual and set(actual) == set(available):
+            return {'selected_units': actual, 'available_requested_units': sorted(available),
+                    'selection_method': 'already_selected'}
+        checks = []
+        # A missed/toggled click may be retried once, but never accepted as a
+        # smaller squad while other requested units remain alive and visible.
+        for _ in range(2):
+            for unit_id in action['units'][:12]:
+                self.bridge.pause()
+                fresh = read_state(self.bridge.read_memory)
+                available = available_units(fresh)
+                actual = read_selection(self.bridge.read_memory)
+                actor = available.get(unit_id)
+                if actor is None or (unit_id in actual and set(actual).issubset(requested)):
+                    continue
+                self.bridge.resume()
+                self.focus(actor['x'], actor['y'])
+                self.bridge.pause()
+                actual = read_selection(self.bridge.read_memory)
+                if unit_id in actual and set(actual).issubset(requested):
+                    continue
+                extend = bool(actual) and set(actual).issubset(requested)
+                if extend:
+                    self._queue_input('key', 'shift', {'down': True})
+                try:
+                    # Shift may enqueue work, but the guest has not advanced.
+                    # Read again here, immediately before queuing the click.
+                    fresh = read_state(self.bridge.read_memory)
+                    actor = available_units(fresh).get(unit_id)
+                    point = game_to_screen(actor['x'], actor['y'], fresh['camera'], height=312) if actor else None
+                    if point is None:
+                        continue
+                    self._queue_input('clickHold', point['x'], point['y'], 1, 0)
+                    self.bridge.resume()
+                    self._settle()
+                finally:
+                    self.bridge.pause()
+                    if extend:
+                        self._queue_input('key', 'shift', {'up': True})
+                actual = read_selection(self.bridge.read_memory)
+                checks.append({'clicked_unit': unit_id, 'selected_units': list(actual)})
+                if not set(actual).issubset(requested):
+                    return {'issued': False, 'inputs': list(self.inputs),
+                            'reason': 'Observed selection contains an unrequested unit',
+                            'selected_units': actual, 'available_requested_units': sorted(available),
+                            'selection_checks': checks}
             fresh = read_state(self.bridge.read_memory)
-            available = {u['id'] for u in fresh['units'] if u['owner'] == state['player_id']
-                         and u['completed'] and u['visible']}
-            if requested.issubset(available):
-                return {'selected_units': actual, 'selection_method': 'already_selected'}
-        selected = []
-        for unit_id in action['units'][:12]:
-            self.bridge.pause()
-            fresh = read_state(self.bridge.read_memory)
-            actor = next((u for u in fresh['units'] if u['id'] == unit_id), None)
-            if not actor or actor['owner'] != state['player_id'] or not actor['completed'] or not actor['visible']:
-                continue
-            self.bridge.resume()
-            self.focus(actor['x'], actor['y'])
-            self.bridge.pause()
-            fresh = read_state(self.bridge.read_memory)
-            actor = next((u for u in fresh['units'] if u['id'] == unit_id), None)
-            available = actor and actor['owner'] == state['player_id'] and actor['completed'] and actor['visible']
-            point = game_to_screen(actor['x'], actor['y'], fresh['camera'], height=312) if available else None
-            if point is None:
-                continue
-            self.bridge.resume()
-            if selected:
-                self._input('key', 'shift', {'down': True})
-            try:
-                self._input('clickHold', point['x'], point['y'], 100, 0)
-            finally:
-                if selected:
-                    self._input('key', 'shift', {'up': True})
-            selected.append(unit_id)
-        if not selected:
-            return {'issued': False, 'inputs': list(self.inputs), 'reason': 'Squad became unavailable'}
-        self.bridge.pause()
-        actual = read_selection(self.bridge.read_memory)
-        if not actual or not set(actual).issubset(set(action['units'])):
-            return {'issued': False, 'inputs': list(self.inputs), 'reason': 'Observed selection differs from requested squad',
-                    'selected_units': actual}
-        return {'selected_units': actual, 'selection_method': 'shift_click'}
+            available = available_units(fresh)
+            actual = read_selection(self.bridge.read_memory)
+            if actual and set(actual) == set(available):
+                return {'selected_units': actual, 'available_requested_units': sorted(available),
+                        'selection_method': 'shift_click', 'selection_checks': checks}
+        return {'issued': False, 'inputs': list(self.inputs),
+                'reason': 'Could not select every surviving visible requested unit',
+                'selected_units': actual, 'available_requested_units': sorted(available),
+                'missing_units': sorted(set(available) - set(actual)),
+                'selection_checks': checks}
 
     def _squad(self, state, action):
         """Apply the model's command to a verified selection."""
@@ -359,7 +411,7 @@ class InputAdapter:
                 w, h = BUILDING_SIZE[action['building']]
                 point = self.focus(**action['point'], margin_x=w // 2 + 24, margin_y=h // 2 + 28)
                 self._input('keyHold', 'b', 60)
-                self._input('keyHold', {109: 's', 110: 'r'}[action['building']], 60)
+                self._input('keyHold', {109: 's', 110: 'r', 111: 'b'}[action['building']], 60)
                 # The original shareware placement cursor denotes the upper-left
                 # tile, whereas CUnit coordinates denote the footprint center.
                 px, py = point['x'] - w // 2, point['y'] - h // 2

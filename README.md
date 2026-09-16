@@ -111,32 +111,42 @@ answer would instead require a later request, as described in the
 [TypeSafe API documentation](https://docs.typesafe.ai/primitives#when-one-question-depends-on-another).
 
 The prompt includes ordinary StarCraft guidance: establish mineral income,
-produce affordable reinforcements while other orders continue, keep a useful
-combat force together, and explore for remaining enemies. These instructions
+produce affordable reinforcements while other orders continue, assemble roughly
+eight to twelve Marines together before an unsupported push, rebuild after
+losses, and explore for remaining enemies. These instructions
 contain no enemy-base coordinates or predetermined mission route.
 
 | Model choice | Candidate supplied by the harness | Original game controls |
 | --- | --- | --- |
 | Focus fire | A currently visible hostile unit or building | Select squad, `A`, click target |
-| Attack toward enemies | A visible enemy group's position | Select squad, `A`, click ground |
+| Attack toward enemies | A visible enemy group's position or a previously seen structure location | Select squad, `A`, click ground |
 | Explore | A bounded north/east/south/west advance from the squad | Select squad, `A`, click ground |
-| Retreat or regroup | A point away from a visible threat, an observed friendly base, or the friendly force's center | Select squad, `M`, click ground |
+| Retreat or regroup | A point away from a visible threat, an observed friendly base for assembling replacements, or the friendly force's center | Select squad, `M`, click ground |
 | Gather minerals | An available SCV and an observed mineral field | Select SCV, right-click minerals |
 | Train Marine or SCV | An idle compatible producer with sufficient minerals and supply | Select Barracks or Command Center, `M` or `S` |
-| Build Supply Depot | An available SCV and an open candidate site near the friendly base | Select SCV, `B`, `S`, click placement |
+| Build Supply Depot or Barracks | An available SCV and an open candidate site near the friendly base | Select SCV, `B`, then `S` or `B`, click placement |
 | Continue current orders | Keep persistent orders in progress | No new input |
 
 The deterministic adapter groups nearby selectable combat units into squads of
 at most twelve, selects them with ordinary clicks and Shift-clicks, pans the
-camera, and checks the game's resulting selection. It supplies up to eight
+camera, and requires the full surviving selectable squad to be selected before
+issuing its order. Mouse clicks are queued against paused position snapshots;
+each click's resulting selection is checked. It supplies up to eight
 squads, four nearest visible focus targets per squad, known costs, prerequisites,
 and tile-aligned construction candidates. Exploration geometry uses the squad's
 observed position and map bounds; the game determines terrain passability.
 Recent observed friendly positions help Jev track where it has already moved.
+The harness also remembers up to thirty-two enemy structures actually seen in
+earlier observations and offers up to four recent locations per squad as
+attack-move destinations. Stale sightings are explicitly uncertain, and focus
+fire still requires current visibility. Movement history distinguishes new
+units from dead units whose slots the original game reuses.
 
 Economy options cap the offered workforce at twelve SCVs and the Marine force
 at seventy-two, with one queued unit per producer. Depots are offered near the
-supply limit, with one unfinished depot at a time. Workers inside refineries,
+supply limit, with one unfinished depot at a time.
+Barracks can be rebuilt or expanded to three, with one under construction at a
+time, for the original cost of 150 minerals each. Workers inside refineries,
 unfinished units, and workers already constructing cannot be retasked through
 these options. This action-space design is part of the experiment: Jev selects
 a category and its supplied command, and the adapter translates that selection into input.

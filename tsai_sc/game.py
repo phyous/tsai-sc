@@ -201,6 +201,10 @@ def read_state(read_bytes: ReadBytes) -> dict:
                         "enemy" if owner in mission["enemies"] else "neutral")
         observed = {
             "id": index, "address": UNIT_BASE + index * UNIT_SIZE,
+            # Original allocation 0x4204FD increments byte+0xA5 and masks0x1F.
+            # Handle validation 0x4230FB compares it to reject a reused slot.
+            # Keep the pool ID for controls; pair it with this incarnation in history.
+            "generation": data[0xA5] & 0x1F,
             "type_id": type_id, "type": UNIT_NAMES.get(type_id, f"Unit {type_id}"),
             "owner": owner, "x": x, "y": y, "hp": (hp_raw + 255) // 256,
             "completed": bool(flags & 1), "order_id": data[0x4D],

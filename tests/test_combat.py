@@ -174,7 +174,7 @@ class CombatTests(unittest.TestCase):
         self.assertFalse(any(action["kind"] == "gather" for action in actions.values()))
         self.assertTrue(any(action["kind"] == "build" for action in actions.values()))
         observed["units"].append(unit(40, 109, completed=False, name="Supply Depot"))
-        self.assertFalse(any(action["kind"] == "build" for action in candidates(observed).values()))
+        self.assertFalse(any(action.get("building") == 109 for action in candidates(observed).values()))
 
     def test_exploration_memory_distinguishes_ordered_destination_from_observed_position(self):
         observed = state()
@@ -217,6 +217,42 @@ class CombatTests(unittest.TestCase):
         self.assertEqual(model["recent_model_orders"][0]["units"], [2, 9])
         self.assertEqual(model["squads"][0]["last_advance_order"]["matched_member_ids"], [2])
         self.assertIn("only to matched members", model["squads"][0]["last_advance_order"]["note"])
+
+    def test_recycled_pool_id_does_not_inherit_a_dead_units_advance(self):
+        observed = state()
+        observed["units"][0]["generation"] = 3  # New Marine in former pool slot.
+        observed["units"][1]["generation"] = 4
+        history = [{"kind": "explore", "squad": "Alpha", "units": [1, 2],
+                    "unit_generations": {"1": 2, "2": 4}, "point": {"x": 2400, "y": 1500}, "accepted": True}]
+        model, _ = request_for(observed, candidates(observed), history)
+        squad = model["squads"][0]
+        self.assertEqual({member["id"]: member["generation"] for member in squad["members"]}, {1: 3, 2: 4})
+        self.assertEqual(squad["last_advance_order"]["matched_member_ids"], [2])
+        self.assertEqual(squad["last_advance_order"]["matched_member_generations"], {"2": 4})
+        self.assertEqual(model["recent_model_orders"][0]["unit_generations"], {"1": 2, "2": 4})
+        history[0]["units"] = [1]
+        model, _ = request_for(observed, candidates(observed), history)
+        self.assertNotIn("last_advance_order", model["squads"][0])
+
+    def test_generation_known_units_reject_legacy_or_invalid_generation_history(self):
+        observed = state()
+        observed["units"][0]["generation"] = 0
+        observed["units"][1]["generation"] = 1
+        history = [{"kind": "explore", "units": [1, 2], "point": {"x": 800, "y": 400}, "accepted": True}]
+        for generations in (None, {"1": 32, "2": False}, {"1": -1, "2": "1"}):
+            with self.subTest(generations=generations):
+                history[0]["unit_generations"] = generations
+                model, _ = request_for(observed, candidates(observed), history)
+                self.assertNotIn("last_advance_order", model["squads"][0])
+                self.assertNotIn("unit_generations", model["recent_model_orders"][0])
+
+    def test_legacy_generation_unknown_identity_matching_is_explicit(self):
+        observed = state()
+        history = [{"kind": "explore", "units": [1, 2], "point": {"x": 800, "y": 400}, "accepted": True}]
+        model, _ = request_for(observed, candidates(observed), history)
+        self.assertEqual(model["squads"][0]["last_advance_order"]["matched_member_ids"], [1, 2])
+        self.assertIn("Legacy ID-only match", model["squads"][0]["last_advance_order"]["note"])
+        self.assertIn("lacks generations", model["recent_model_orders"][0]["identity_note"])
 
     def test_idle_progress_summary_and_history_do_not_anchor_repeated_noops(self):
         observed = state()
@@ -272,6 +308,147 @@ class CombatTests(unittest.TestCase):
                 observed["units"][3]["order_id"] = order
                 self.assertTrue(any(action["kind"] == "gather" for action in candidates(observed).values()))
 
+    def test_regroup_at_observed_base_is_available_without_visible_enemies(self):
+        observed = state()
+        observed["units"][0].update(x=1000, y=500)
+        observed["units"][1].update(x=1024, y=500)
+        actions = candidates(observed)
+        regroup = actions["Alpha: regroup at friendly base"]
+        self.assertEqual(regroup["kind"], "regroup")
+        self.assertEqual(regroup["point"], {"x": 280, "y": 320})
+        self.assertEqual(regroup["units"], [1, 2])
+        self.assertFalse(any(action["kind"] == "attack_target" for action in actions.values()))
+        observed["units"][2]["visible"] = False
+        self.assertNotIn("Alpha: regroup at friendly base", candidates(observed))
+
+    def test_regroup_at_base_is_omitted_within_192_pixels(self):
+        observed = state()
+        observed["units"] = [unit(1, x=471, y=320), unit(3, 106, x=280, y=320, name="Command Center")]
+        self.assertNotIn("Alpha: regroup at friendly base", candidates(observed))
+        observed["units"][0]["x"] = 472
+        self.assertIn("Alpha: regroup at friendly base", candidates(observed))
+        observed["units"][0]["x"] = 280
+        self.assertNotIn("Alpha: regroup at friendly base", candidates(observed))
+
+    def test_largest_squad_distinguishes_scattered_army_from_assembled_force(self):
+        observed = state()
+        observed["units"].extend(unit(i, x=1900 + i) for i in range(50, 54))
+        model, _ = request_for(observed, candidates(observed))
+        self.assertEqual(model["current_activity"]["living_combat_units"], 6)
+        self.assertEqual(model["current_activity"]["largest_selectable_squad"], 4)
+        self.assertIn("8–12 Marines together", model["mission_playbook"][2])
+        self.assertIn("Immediate defense", model["mission_playbook"][2])
+
+    def test_barracks_building_options_enforce_cost_count_and_construction_limits(self):
+        observed = state()
+        buildings = lambda: [action for action in candidates(observed).values() if action.get("building") == 111]
+        options = buildings()
+        self.assertTrue(options)
+        self.assertLessEqual(len(options), 2)
+        for option in options:
+            self.assertEqual(option["mineral_cost"], 150)
+            self.assertEqual(option["units"], [4])
+            self.assertEqual(option["point"]["x"] % 32, 0)
+            self.assertEqual(option["point"]["y"] % 32, 16)
+        request_for(observed, candidates(observed))
+        observed["minerals"] = 149
+        self.assertFalse(buildings())
+        observed["minerals"] = 1000
+        observed["units"].append(unit(30, 111, x=2000, y=1500, completed=False, name="Barracks"))
+        self.assertFalse(buildings())
+        observed["units"][-1]["completed"] = True
+        self.assertTrue(buildings())
+        observed["units"].extend([unit(31, 111, x=2200, y=1500, name="Barracks"), unit(32, 111, x=2400, y=1500, name="Barracks")])
+        self.assertFalse(buildings())
+        observed["units"] = [u for u in observed["units"] if u["type_id"] != 111]
+        observed["units"][3]["completed"] = False
+        self.assertFalse(buildings())
+
+    def test_structure_memory_offers_uncertain_ground_advance_not_hidden_focus_fire(self):
+        observed = state()
+        sighting = {"id": 70, "type": "Barracks", "type_id": 111, "x": 1200, "y": 900, "last_seen_frame": 100}
+        history = [{"observed_enemy_structures": [sighting]}]
+        actions = candidates(observed, history=history)
+        advance = next(action for action in actions.values() if action.get("objective") == "last-seen enemy structure")
+        self.assertEqual(advance["kind"], "attack_move")
+        self.assertNotIn("target", advance)
+        self.assertEqual(advance["point"], {"x": 1200, "y": 900})
+        self.assertIn("not currently visible", advance["label"])
+        self.assertFalse(any(action["kind"] == "attack_target" for action in actions.values()))
+        model, _ = request_for(observed, actions, history)
+        memory = model["known_enemy_structures"][0]
+        self.assertFalse(memory["currently_visible"])
+        self.assertEqual(memory["last_seen_frame"], 100)
+        # An injected hidden position cannot update a legitimate last sighting.
+        observed["units"].append(unit(70, 111, owner=0, x=2789, y=1837, visible=False, name="Barracks"))
+        self.assertEqual(candidates(observed, history=history), actions)
+        self.assertEqual(request_for(observed, actions, history)[0], model)
+
+    def test_current_structure_sightings_refresh_memory_and_close_targets_need_no_advance(self):
+        observed = state()
+        history = [{"observed_enemy_structures": [{"id": 70, "type": "Barracks", "type_id": 111, "x": 1200, "y": 900, "last_seen_frame": 100}]}]
+        observed["units"].append(unit(70, 111, owner=0, x=430, y=420, name="Barracks"))
+        actions = candidates(observed, history=history)
+        self.assertFalse(any(action.get("objective") == "last-seen enemy structure" for action in actions.values()))
+        self.assertTrue(any(action.get("target") == 70 for action in actions.values()))
+        model, _ = request_for(observed, actions, history)
+        self.assertEqual(len(model["known_enemy_structures"]), 1)
+        memory = model["known_enemy_structures"][0]
+        self.assertEqual((memory["x"], memory["y"], memory["last_seen_frame"]), (430, 420, 300))
+        self.assertTrue(memory["currently_visible"])
+
+    def test_structure_memory_is_bounded_and_rejects_invalid_or_future_sightings(self):
+        observed = state()
+        sightings = [{"id": 70 + i, "type": "Barracks", "type_id": 111, "x": 1200 + i, "y": 900, "last_seen_frame": i} for i in range(40)]
+        invalid = [{**sightings[0], "id": 500, "last_seen_frame": 301},
+                   {**sightings[0], "id": 501, "x": 4000},
+                   {**sightings[0], "id": 502, "type_id": 0},
+                   {**sightings[0], "id": 503, "visible": False},
+                   {**sightings[0], "id": 504, "type_id": 174}]
+        # Sightings persist beyond the short action-history window.
+        history = [{"observed_enemy_structures": sightings + invalid}] + [{"kind": "continue"} for _ in range(70)]
+        actions = candidates(observed, history=history)
+        memories = request_for(observed, actions, history)[0]["known_enemy_structures"]
+        self.assertEqual(len(memories), 32)
+        self.assertEqual([memory["last_seen_frame"] for memory in memories], list(range(39, 7, -1)))
+        self.assertEqual(len([action for action in actions.values() if action.get("objective") == "last-seen enemy structure"]), 4)
+
+    def test_structure_memory_does_not_mark_a_reused_visible_marine_as_the_structure(self):
+        observed = state()
+        sighting = {"id": 70, "generation": 2, "type": "Barracks", "type_id": 111,
+                    "x": 1200, "y": 900, "last_seen_frame": 100}
+        history = [{"observed_enemy_structures": [sighting]}]
+        observed["units"].append({**unit(70, owner=0, x=560, y=420), "generation": 3})
+        model, _ = request_for(observed, candidates(observed, history=history), history)
+        self.assertEqual(len(model["known_enemy_structures"]), 1)
+        memory = model["known_enemy_structures"][0]
+        self.assertEqual((memory["id"], memory["generation"], memory["x"], memory["y"]), (70, 2, 1200, 900))
+        self.assertFalse(memory["currently_visible"])
+        self.assertIn("unconfirmed", memory["uncertainty"])
+
+    def test_structure_incarnations_have_separate_visibility_and_keep_stale_positions(self):
+        observed = state()
+        history = [{"observed_enemy_structures": [{"id": 70, "generation": 2, "type": "Barracks", "type_id": 111,
+                                                  "x": 1200, "y": 900, "last_seen_frame": 100}]}]
+        observed["units"].append({**unit(70, 109, owner=0, x=1800, y=1000, name="Supply Depot"), "generation": 3})
+        model, _ = request_for(observed, candidates(observed, history=history), history)
+        memories = {memory["generation"]: memory for memory in model["known_enemy_structures"]}
+        self.assertEqual(set(memories), {2, 3})
+        self.assertFalse(memories[2]["currently_visible"])
+        self.assertTrue(memories[3]["currently_visible"])
+        self.assertEqual(memories[2]["x"], 1200)
+        self.assertEqual(memories[3]["x"], 1800)
+
+    def test_generation_known_structure_does_not_promote_legacy_sighting_to_visible(self):
+        observed = state()
+        history = [{"observed_enemy_structures": [{"id": 70, "type": "Barracks", "type_id": 111,
+                                                  "x": 1200, "y": 900, "last_seen_frame": 100}]}]
+        observed["units"].append({**unit(70, 111, owner=0, x=1800, y=1000, name="Barracks"), "generation": 3})
+        model, _ = request_for(observed, candidates(observed, history=history), history)
+        old = next(memory for memory in model["known_enemy_structures"] if "generation" not in memory)
+        self.assertFalse(old["currently_visible"])
+        self.assertEqual(old["last_seen_frame"], 100)
+
 
 class GraphTests(unittest.TestCase):
     def setUp(self):
@@ -322,6 +499,7 @@ class GraphTests(unittest.TestCase):
 
     def test_empty_categories_are_absent_and_singletons_have_no_child_question(self):
         observed = state()
+        observed["minerals"] = 50
         _, questions, routing = graph_request_for(observed, candidates(observed))
         self.assertNotIn("Engage", routing["branches"])
         self.assertNotIn("Reposition", routing["branches"])

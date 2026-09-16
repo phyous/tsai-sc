@@ -44,6 +44,19 @@ class Memory:
 
 
 class DecoderTests(unittest.TestCase):
+    def test_generation_distinguishes_reused_pool_slot_without_changing_id(self):
+        memory = Memory()
+        # The demo's allocation routine at0x4204FD increments byte+0xA5,
+        # masking it to five bits;0x4230FB validates that same incarnation.
+        memory.put(UNIT_BASE + 0xA5, "B", 0x1F)
+        first = read_state(memory.read)["units"][0]
+        self.assertEqual((first["id"], first["address"], first["generation"]), (0, UNIT_BASE, 31))
+        memory.put(UNIT_BASE + 0xA5, "B", 0)
+        reused = read_state(memory.read)["units"][0]
+        self.assertEqual((reused["id"], reused["address"], reused["generation"]), (0, UNIT_BASE, 0))
+        memory.put(UNIT_BASE + 0xA5, "B", 0xE5)
+        self.assertEqual(read_state(memory.read)["units"][0]["generation"], 5)
+
     def test_original_pause_flag_is_independent_of_outcome_and_rejects_invalid_values(self):
         memory = Memory()
         self.assertIs(read_state(memory.read)["game_paused"], False)

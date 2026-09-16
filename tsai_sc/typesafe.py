@@ -168,7 +168,7 @@ def validate_response(response: Any, questions: dict[str, dict]) -> dict:
     """Validate the complete response and return only known public output fields."""
     failure = "TypeSafe returned an invalid response; no action was selected."
     if not isinstance(response, dict):
-        raise ResponseValidationError(failure)
+        raise ResponseValidationError(failure, {'stage': 'response_object'})
     model = response.get("model")
     answers = response.get("answers")
     usage = response.get("usage")
@@ -180,13 +180,18 @@ def validate_response(response: Any, questions: dict[str, dict]) -> dict:
         or not isinstance(usage, dict)
         or not all(type(usage.get(key)) is int and usage[key] >= 0 for key in ("input_tokens", "output_tokens"))
     ):
-        raise ResponseValidationError(failure)
+        raise ResponseValidationError(failure, {'stage': 'response_schema',
+                                                'answers_object': isinstance(answers, dict),
+                                                'expected_answers': len(questions),
+                                                'returned_answers': len(answers) if isinstance(answers, dict) else None,
+                                                'answer_keys_match': isinstance(answers, dict) and set(answers) == set(questions),
+                                                'usage_object': isinstance(usage, dict)})
     clean_answers = {}
-    for name, question in questions.items():
+    for question_index, (name, question) in enumerate(questions.items()):
         answer = answers[name]
         kind = question["type"]
         if not isinstance(answer, dict) or answer.get("type") != kind:
-            raise ResponseValidationError(failure)
+            raise ResponseValidationError(failure, {'stage': 'answer_type', 'question_index': question_index})
         if kind == "noul":
             if not _number(answer.get("noul")):
                 raise ResponseValidationError(failure)
@@ -202,7 +207,7 @@ def validate_response(response: Any, questions: dict[str, dict]) -> dict:
             or not probability_total_valid(probabilities.values(), rounded_choice=kind == 'choice')
             or not _number(confidence)
         ):
-            diagnostics = {'probability_map': isinstance(probabilities, dict), 'expected_options': len(expected)}
+            diagnostics = {'stage': 'probabilities', 'question_index': question_index, 'probability_map': isinstance(probabilities, dict), 'expected_options': len(expected)}
             if isinstance(probabilities, dict):
                 numeric = all(_number(p, low=-1e100, high=1e100) for p in probabilities.values())
                 diagnostics.update(returned_options=len(probabilities), missing_options=len(expected - set(probabilities)),
@@ -215,9 +220,12 @@ def validate_response(response: Any, questions: dict[str, dict]) -> dict:
         if kind == "choice":
             choice = answer.get("choice")
             if not isinstance(choice, str) or choice not in expected:
-                raise ResponseValidationError(failure)
+                raise ResponseValidationError(failure, {'stage': 'choice_key', 'question_index': question_index,
+                                                        'choice_is_text': isinstance(choice, str), 'choice_is_expected': False})
             if not math.isclose(probabilities[choice], max(probabilities.values()), abs_tol=1e-9, rel_tol=0):
-                raise ResponseValidationError(failure)
+                raise ResponseValidationError(failure, {'stage': 'choice_argmax', 'question_index': question_index,
+                                                        'selected_probability': probabilities[choice],
+                                                        'maximum_probability': max(probabilities.values())})
             clean["choice"] = choice
         else:
             score = answer.get("score")

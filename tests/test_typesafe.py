@@ -138,6 +138,22 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(result['metadata']['rejected_response_attempts'], 0)
                 self.assertEqual(len(transport.requests), 1)
 
+    def test_rejected_choice_diagnostics_identify_the_failure_without_remote_text(self):
+        data = api_response()
+        data['answers']['action']['choice'] = 'Bearer remote-secret-must-not-be-copied'
+        client, _, _ = self.client(Response(data), max_retries=0)
+        with self.assertRaises(ResponseValidationError) as rejected:
+            client.evaluate({}, QUESTIONS)
+        self.assertEqual(rejected.exception.diagnostics['stage'], 'choice_key')
+        self.assertNotIn('remote-secret', repr(rejected.exception.diagnostics))
+        data['answers']['action']['choice'] = 'gather'
+        client, _, _ = self.client(Response(data), max_retries=0)
+        with self.assertRaises(ResponseValidationError) as rejected:
+            client.evaluate({}, QUESTIONS)
+        self.assertEqual(rejected.exception.diagnostics,
+                         {'stage': 'choice_argmax', 'question_index': 0,
+                          'selected_probability': .15, 'maximum_probability': .8})
+
     def test_choice_rounding_exception_rejects_larger_or_noncent_errors(self):
         probabilities = (
             {'gather': 0.15, 'train': 0.78, 'wait': 0.05},  # 0.98

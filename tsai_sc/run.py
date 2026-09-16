@@ -19,6 +19,16 @@ def write_json(path, value):
     Path(path).write_text(json.dumps(value, indent=2) + '\n')
 
 
+def visible_structure_sightings(state):
+    """Remember only structure positions the player actually saw this frame."""
+    return [
+        {key: unit[key] for key in ('id', 'type', 'type_id', 'x', 'y', 'generation') if key in unit} | {'last_seen_frame': state['frame']}
+        for unit in state['units']
+        if unit.get('visible') is True and unit.get('relationship') == 'enemy'
+        and 106 <= unit['type_id'] <= 173
+    ]
+
+
 class Recorder:
     def __init__(self, bridge, directory, fps=8):
         self.bridge = bridge
@@ -186,7 +196,10 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
                     decisions.flush()
                     history.append({'command': selected['label'], 'kind': selected['kind'], 'squad': selected.get('squad'), 'point': selected.get('point'),
                                     'units': executed.get('units', [executed['unit']] if 'unit' in executed else []),
+                                    'unit_generations': {str(unit['id']): unit['generation'] for unit in state['units']
+                                                         if unit['id'] in executed.get('units', []) and 'generation' in unit},
                                     'squad_centers': [{'name': squad['name'], **squad['center']} for squad in model_state.get('squads', [])],
+                                    'observed_enemy_structures': visible_structure_sightings(state),
                                     'frame': state['frame'], 'accepted': verified['accepted'], 'minerals_after': after['minerals'], 'gas_after': after['gas']})
                     if routing:
                         intent = response['answers'][routing['root_question']]
