@@ -75,6 +75,9 @@ export class CpuCapture {
   reset() { this.workerSession = undefined; }
   async capture(session: any): Promise<Buffer> {
     if (!this.workerSession) {
+      // Follow BottleShip's worker transport initialization explicitly, so the
+      // first capture does not depend on an earlier diagnostic attachment.
+      await session.send('Target.setDiscoverTargets',{discover:true});
       const targets = await session.send('Target.getTargets');
       const candidates = (targets.result?.targetInfos ?? []).filter((target: any) =>
         target.type === 'worker' && target.url.startsWith('http://localhost:5174/src/worker/emulator.worker.ts?'));
@@ -82,6 +85,7 @@ export class CpuCapture {
       const attached = await session.send('Target.attachToTarget',{targetId:candidates[0].targetId,flatten:true});
       this.workerSession = attached.result?.sessionId;
       if (!this.workerSession) throw Error('Could not attach to emulator worker');
+      await session.send('Runtime.enable',{},this.workerSession);
     }
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try {

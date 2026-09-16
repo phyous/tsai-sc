@@ -79,6 +79,10 @@ test('capture reuses one attachment and submits only the fixed read-only express
   const capture=new CpuCapture();
   await capture.capture(session); await capture.capture(session);
   expect(calls.filter(call=>call[0]==='Target.attachToTarget')).toHaveLength(1);
+  expect(calls.filter(call=>call[0]==='Target.setDiscoverTargets')).toHaveLength(1);
+  expect(calls.filter(call=>call[0]==='Runtime.enable')).toEqual([['Runtime.enable',{},'worker-session']]);
+  expect(calls.slice(0,4).map(call=>call[0])).toEqual([
+    'Target.setDiscoverTargets','Target.getTargets','Target.attachToTarget','Runtime.enable']);
   const evaluations=calls.filter(call=>call[0]==='Runtime.evaluate');
   expect(evaluations).toHaveLength(2);
   for(const call of evaluations) {
