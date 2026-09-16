@@ -1,6 +1,6 @@
 # Lessons from developing the harness
 
-These notes describe development attempts through attempt 14 and subsequent
+These notes describe development attempts through attempt 15 and subsequent
 changes and probes. They do not establish a combat victory or a measured improvement in
 win rate. Code checks, controlled game tests, and strategy hypotheses provide
 different kinds of evidence.
@@ -332,3 +332,27 @@ different kinds of evidence.
     See [lane candidates](../tsai_sc/combat.py), [runner](../tsai_sc/run.py),
     [lane tests](../tests/test_combat.py), and
     [overlay tests](../tests/test_render.py).
+
+18. **An original fatal dialog can be invisible to game-only capture.** Attempt
+    15 stopped progressing at original game frame 1818 after 38 recorded model
+    decisions. The final observation still contained all eight starting Marines,
+    four additional completed Marines, and nine kill credits on those units.
+    All twelve recorded Economy decisions had accepted orders. These are early
+    observations, not evidence of a completed mission or a controlled comparison.
+
+    Runtime inspection found the main guest thread awaiting `MessageBoxA`:
+    the original game reported a critical `_CTRLNODE` error, code `0x8`, and
+    instructed the user to terminate. This host-rendered dialog sits outside
+    the captured DirectDraw pixels. The CPU and a background thread continued,
+    while the main thread waited for the dialog; no victory or defeat outcome
+    was recorded. Heap diagnostics showed about 54 MB allocated and substantial
+    unused space, so total heap exhaustion is not established. The cause of the
+    original allocation error remains unresolved; a fresh boot is isolation,
+    not proof of a repair.
+
+    The runner now stops after sixty accumulated seconds of resumed execution
+    without game-clock progress. An observed original mission pause is excluded,
+    and progress resets the counter. This bounds an otherwise indefinite wait
+    and directs inspection toward a blocking dialog or runtime failure; it does
+    not dismiss dialogs or synthesize an outcome. See the
+    [runner guard](../tsai_sc/run.py).
