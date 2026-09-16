@@ -1,6 +1,6 @@
 # Lessons from developing the harness
 
-These notes describe development attempts through attempt 13 and subsequent
+These notes describe development attempts through attempt 14 and subsequent
 changes and probes. They do not establish a combat victory or a measured improvement in
 win rate. Code checks, controlled game tests, and strategy hypotheses provide
 different kinds of evidence.
@@ -264,7 +264,24 @@ different kinds of evidence.
     another during the following wait. An optional shorter observation interval
     during visible nearby combat reduces the waiting component; it does not
     choose commands or establish that those losses would have been prevented.
-    Selection overhead remains a separate issue to measure.
+    Selection overhead remains a separate component of reaction time.
+
+    Before attempt 15, selection acknowledgment changed from a fixed wait to
+    a 20 ms running interval followed, if needed, by 40 ms retries, capped at
+    220 ms per click. Capture and selection readback occur paused. Separate
+    live checks retained exact selections while reducing eight-Marine selection
+    from 55 to 27 game frames and twelve-Marine selection from 86 to 40; every
+    click was acknowledged on its first poll. These measured cases do not
+    establish latency under all battle conditions.
+
+    Focus fire now arms `A` before its final target snapshot, rechecks visible
+    hostile identity and generation, and queues a 1 ms click while paused.
+    If the target is unavailable or outside the viewport, Escape cancels only
+    that armed attack cursor. Regression tests cover this sequence; there was
+    no visible enemy available for the separate live focus check. No claim of
+    improved combat accuracy follows from the selection timing tests alone.
+    See [input code](../tsai_sc/controller.py) and
+    [controller tests](../tests/test_controller.py).
 
     A control-group experiment did not yield a working recall through this
     runtime: after Ctrl+digit assignment and selecting a Command Center,
@@ -288,3 +305,30 @@ different kinds of evidence.
     exactly SCV 1676. A mineral right-click produced gather order 85 targeting
     mineral 1681. The fallback retains the exact-actor guard. Pending-build
     tests distinguish active order 30/33 from stale queues on mining workers.
+
+17. **Broader exploration did not ensure mission completion or sustained production.**
+    Attempt 14 was stopped without victory after 263 recorded decisions; it
+    did not reach an original-engine defeat result either. Sampled owned Marine
+    positions covered 74 of 96 cells on the 256-pixel grid, which is not fog
+    coverage. The first Barracks disappeared by call 61 after visible damage.
+    No construction or upgrade command was selected during the attempt,
+    although construction candidates remained available. Its final recorded
+    observation still had 1,918 minerals, 200 gas, ten mineral workers, fifteen
+    completed Marines, and one surviving Barracks producing a Marine.
+
+    This motivates an opt-in scheduling experiment rather than a claim that
+    economy neglect alone caused the incomplete mission. `--separate-economy`
+    alternates separate Economy and Army model calls, each with fresh observed
+    state, filtered legal candidates, and a genuine Continue option. Economy
+    handles workers, production, buildings, supply, and research; Army handles
+    military orders. Only the selected command from each response executes.
+    No additional observation wait follows Economy; the normal or combat wait
+    follows Army. Inputs themselves still advance the game. A lane offering
+    only Continue is skipped without fabricating a model response.
+
+    Each actual call retains its original single-command graph and evidence
+    record. The visualizer identifies the lane without changing probabilities.
+    Regular economy opportunities do not force spending or guarantee a win.
+    See [lane candidates](../tsai_sc/combat.py), [runner](../tsai_sc/run.py),
+    [lane tests](../tests/test_combat.py), and
+    [overlay tests](../tests/test_render.py).

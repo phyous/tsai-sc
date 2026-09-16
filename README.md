@@ -63,7 +63,8 @@ python -m tsai_sc.run \
   --env-file "$HOME/.config/tsai-sc/env" \
   --run-dir runs/my-attempt \
   --max-requests 1800 --max-seconds 3600 \
-  --decision-seconds 3 --combat-decision-seconds 0.5
+  --decision-seconds 3 --combat-decision-seconds 0.5 \
+  --separate-economy
 
 python -m tsai_sc.render runs/my-attempt \
   --output recordings/strongarm.mp4 --speed 4 --fps 30
@@ -81,6 +82,11 @@ The optional combat interval applies when a visible hostile is within 512 pixels
 of an owned combat unit before or after a command. It shortens the next wait;
 selection and input execution still advance the game. Both intervals and actual
 decision timing are recorded. Omit the flag to use one fixed interval.
+The opt-in `--separate-economy` schedule alternates an Economy model call with
+an Army model call; omit it to retain one combined command menu per observation.
+Each call uses a fresh observation and can select one command or Continue.
+There is no additional observation wait after Economy; the configured baseline
+or combat wait follows Army. Ordinary input execution still advances the game.
 
 Setup downloads a pinned BottleShip revision and verifies the demo bundle's
 SHA-256. It keeps the runtime, game data, logs, and an isolated browser profile
@@ -109,6 +115,16 @@ categories. Independent `action_<category>` Choice questions choose concrete
 commands within each category. The API evaluates those questions together from
 the same observation; code routes the selected category to its selected command.
 A category with one available command needs no second model question.
+
+With `--separate-economy`, the same graph operates on filtered candidates in two
+separate API calls. Economy offers gathering, production, construction, research,
+and Continue; Army offers combat, exploration, repositioning, and Continue.
+The Army observation is refreshed after the Economy command, and only the
+selected command from each response can execute. If a lane has only Continue,
+it needs no API call. This gives economic decisions regular opportunities
+without automatically building or training anything. Each actual call retains
+its own request, graph, probabilities, and input result; the video labels it
+**Economy decision** or **Army decision**. This schedule remains experimental.
 
 The visualizer shows the actual category distribution and the selected branch's
 action distribution separately. It never multiplies them into a claimed API
@@ -154,9 +170,16 @@ and tile-aligned construction candidates. Economy commands likewise require the
 exact requested actor after a paused 1 ms selection tap; an obscured SCV can be
 recovered with a small selection box, followed by the same exact-actor check.
 Squad selection also checks identity generations to reject reused unit slots.
+Selection acknowledgment starts after 20 ms of running time and retries in
+40 ms intervals, up to 220 ms per click; recording and readback occur paused.
+Separate live checks reduced selection from 55 to 27 game frames for eight
+Marines and from 86 to 40 for twelve, with exact selections retained.
 Ground attack orders
 use the minimap to avoid turning a ground destination into a click on a building
-sprite; focus fire still clicks a visible target. Exploration geometry uses the squad's
+sprite; focus fire arms `A`, then refreshes the target's visibility, identity,
+and screen position before a paused 1 ms click. An unavailable target cancels
+that armed cursor. This refresh has regression coverage; live combat still
+needs to establish its effect on moving targets. Exploration geometry uses the squad's
 observed position and map bounds; the game determines terrain passability.
 Recent observed friendly positions help Jev track where it has already moved.
 Persistent 256-pixel visitation cells retain sampled owned combat positions
