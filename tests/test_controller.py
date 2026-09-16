@@ -405,6 +405,25 @@ class ControllerTests(unittest.TestCase):
                              [('clickHold', 400, 116, 1, 0)])
             self.assertFalse(bridge.running)
 
+    def test_tiny_box_recovers_occluded_scv_but_never_accepts_extra_units(self):
+        for boxed in ([1], [1, 2]):
+            bridge = Bridge()
+            state = mission()
+            state['units'][0].update(x=400, y=500)
+            state['units'][3].update(x=480, y=576)
+            def selection(_):
+                return boxed if any(call[0] == 'drag' for call in bridge.calls) else [2]
+            with patch('tsai_sc.controller.read_state', return_value=state), \
+                    patch('tsai_sc.controller.read_selection', side_effect=selection):
+                result = self.adapter(bridge).execute(state, {'kind': 'gather', 'unit': 1, 'target': 4})
+            self.assertEqual(result['issued'], boxed == [1])
+            self.assertEqual(result['selected_units'], boxed)
+            self.assertIn(('drag', 396, 112, 404, 120, 0), bridge.calls)
+            self.assertIn(('drag', False), bridge.input_running)
+            self.assertEqual(result['selection_checks'][-1]['method'], 'box_drag')
+            self.assertEqual(('clickHold', 480, 192, 100, 1) in bridge.calls, boxed == [1])
+            self.assertFalse(bridge.running)
+
 
 class CommandFeedbackTests(unittest.TestCase):
     def test_live_refinery_regression_distinguishes_failed_click_from_build_order(self):
@@ -928,6 +947,7 @@ class TacticalControllerTests(unittest.TestCase):
         self.assertTrue(verify_command(state, after, action)['accepted'])
         actor.update(order_id=10, order_target={'x': 450, 'y': 560})
         self.assertTrue(verify_command(state, after, action)['accepted'])
+
 
 
 if __name__ == '__main__':

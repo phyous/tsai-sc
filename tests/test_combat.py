@@ -50,7 +50,10 @@ class CombatTests(unittest.TestCase):
         _, questions = request_for(observed, actions)
         self.assertEqual(set(questions["action"]["criteria"]), set(actions))
         for key, action in actions.items():
-            if action["kind"] != "continue":
+            if action["kind"] == "explore":
+                self.assertIn("toward a destination cell", questions["action"]["criteria"][key])
+                self.assertNotIn("reveal terrain", questions["action"]["criteria"][key])
+            elif action["kind"] != "continue":
                 self.assertEqual(questions["action"]["criteria"][key], action["label"])
 
     def test_armed_defenders_workers_and_unarmed_buildings_have_distinct_roles(self):
@@ -306,6 +309,89 @@ class CombatTests(unittest.TestCase):
         self.assertGreater(model["squads"][0]["last_advance_order"]["distance_from_current_center"], 300)
         self.assertIn("not arrival", model["squads"][0]["last_advance_order"]["note"])
         self.assertEqual(model["recent_model_orders"][0]["units"], [1, 2])
+
+    def test_persistent_visitation_reaches_graph_criteria_without_changing_actions(self):
+        observed = state()
+        for actor in observed["units"]:
+            actor["generation"] = 1
+        old = copy.deepcopy(observed)
+        old["frame"] = 1
+        old["units"][0].update(x=790, y=400)
+        history = [{"combat_snapshot": history_snapshot(old, STRONGARM.combat_types)}]
+        history.extend({"kind": "continue", "frame": frame} for frame in range(2, 100))
+        actions = candidates(observed)
+        frozen = copy.deepcopy(actions)
+        model, questions, routing = graph_request_for(observed, actions, history)
+        self.assertEqual(actions, frozen)
+        self.assertEqual(candidates(observed, history=history), frozen)
+        self.assertEqual(set(questions["action_explore"]["criteria"]),
+                         {key for key, action in frozen.items() if action["kind"] == "explore"})
+        self.assertEqual(set(model["available_command_details"]), set(questions["action_explore"]["criteria"]))
+        east = model["available_command_details"]["Alpha: scout east"]["endpoint_visitation"]
+        self.assertTrue(east["previously_occupied"])
+        self.assertEqual(east["last_prior_observed_frame"], 1)
+        self.assertFalse(east["currently_occupied"])
+        east_label = questions["action_explore"]["criteria"]["Alpha: scout east"]
+        north_label = questions["action_explore"]["criteria"]["Alpha: scout north"]
+        self.assertTrue(east_label.startswith("Alpha (2 units; 2 within 192px of one member): attack-move east toward a previously sampled destination cell at (796, 400)"))
+        self.assertIn("prior owned-combat sample at frame 1", east_label)
+        self.assertIn("current owned-combat sample: no", east_label)
+        self.assertIn("Revisits can serve transit or tactics", east_label)
+        self.assertIn("attack-move north toward a destination cell with no recorded owned-combat sample at (412, 32)", north_label)
+        for label in questions["action_explore"]["criteria"].values():
+            self.assertNotIn("reveal terrain", label)
+        for question in (questions["intent"], questions["action_explore"]):
+            self.assertIn("persistent visitation_summary", question["instructions"])
+            self.assertIn("useful for transit or tactics", question["instructions"])
+            self.assertIn("do not establish fog coverage", question["instructions"])
+        self.assertEqual(routing, graph_routing(frozen))
+
+    def test_visitation_endpoint_distinguishes_current_first_arrival_from_prior_visit(self):
+        observed = state()
+        for actor in observed["units"]:
+            actor["generation"] = 1
+        # Alpha's east endpoint contains a distant owned unit at this observation.
+        observed["units"].append({**unit(50, x=800, y=400), "generation": 1})
+        actions = candidates(observed)
+        model, questions = request_for(observed, actions)
+        fact = model["available_command_details"]["Alpha: scout east"]["endpoint_visitation"]
+        self.assertFalse(fact["previously_occupied"])
+        self.assertTrue(fact["currently_occupied"])
+        label = questions["action"]["criteria"]["Alpha: scout east"]
+        self.assertIn("toward a destination cell with a current owned-combat sample and no prior sample", label)
+        self.assertIn("first recorded owned-combat sample is current", label)
+        self.assertNotIn("no recorded owned-combat sample", label)
+
+    def test_hostile_coordinates_and_ordered_destinations_do_not_change_visitation_facts(self):
+        observed = state()
+        for actor in observed["units"]:
+            actor["generation"] = 1
+        prior = copy.deepcopy(observed)
+        prior["frame"] = 100
+        history = [{"combat_snapshot": history_snapshot(prior, STRONGARM.combat_types)}]
+        actions = candidates(observed)
+        baseline, question = request_for(observed, actions, history)
+        observed["units"].append({**unit(900, owner=0, x=2789, y=1837, visible=False), "generation": 1})
+        history[0]["combat_snapshot"]["visible_hostile_combat"] = [{"x": 2789, "y": 1837}]
+        history[0]["combat_snapshot"]["own_combat"].append({**unit(901, owner=0, x=2789, y=1837), "generation": 1})
+        history[0].update(point={"x": 2501, "y": 1701})
+        updated, updated_question = request_for(observed, actions, history)
+        for key in ("visitation_summary", "available_command_details"):
+            self.assertEqual(updated[key], baseline[key])
+            self.assertNotIn("2789", json.dumps(updated[key]))
+        self.assertEqual(question["action"]["criteria"], updated_question["action"]["criteria"])
+
+    def test_recent_observed_positions_sort_by_latest_visit_not_first_insertion(self):
+        observed = state()
+        history = [{"frame": frame, "kind": "continue", "squad_centers": [{"x": (frame % 20) * 128, "y": (frame // 20) * 128 + 400}]}
+                   for frame in range(1, 26)]
+        history.append({"frame": 299, "kind": "continue", "squad_centers": [{"x": 130, "y": 400}]})
+        history.append({"frame": 2, "kind": "continue", "squad_centers": [{"x": 131, "y": 400}]})
+        model, _ = request_for(observed, candidates(observed), history)
+        positions = model["previously_observed_friendly_positions"]
+        self.assertEqual(len(positions), 24)
+        self.assertEqual(positions[-1], {"x": 130, "y": 400, "observed_frame": 299})
+        self.assertEqual([p["observed_frame"] for p in positions], list(range(3, 26)) + [299])
 
     def test_advance_memory_follows_members_when_reinforcement_changes_squad_names(self):
         observed = state()
@@ -570,6 +656,43 @@ class CombatTests(unittest.TestCase):
             self.assertEqual([action["point"] for action in candidates(observed, history=[failure]).values()
                               if action.get("building") == 111], sites[:2])
 
+    def test_active_worker_build_queue_blocks_same_type_before_structure_appears(self):
+        for order in (30, 33):
+            for building in (109, 111):
+                with self.subTest(order=order, building=building):
+                    observed = state()
+                    observed["minerals"] = 1000
+                    observed["supply"] = {"used": 10, "available": 10}
+                    observed["units"][3].update(order_id=order, build_queue=[building])
+                    observed["units"].append(unit(5, 7, x=1000, y=800, name="SCV"))
+                    offered = {a.get("building") for a in candidates(observed).values() if a["kind"] == "build"}
+                    self.assertNotIn(building, offered)
+                    self.assertIn(111 if building == 109 else 109, offered)
+
+    def test_stale_mining_worker_build_queue_does_not_block_construction(self):
+        for order in (85, 87, 90):
+            for building in (109, 111):
+                with self.subTest(order=order, building=building):
+                    observed = state()
+                    observed["minerals"] = 1000
+                    observed["supply"] = {"used": 10, "available": 10}
+                    observed["units"][3].update(order_id=order, build_queue=[building])
+                    self.assertIn(building, {a.get("building") for a in candidates(observed).values() if a["kind"] == "build"})
+
+    def test_pending_third_barracks_and_existing_unfinished_structure_prevent_extra_build(self):
+        observed = state()
+        observed["minerals"] = 1000
+        observed["units"].extend([unit(30, 111, x=2000, y=1500, name="Barracks"),
+                                   unit(31, 111, x=2300, y=1500, name="Barracks"),
+                                   unit(5, 7, x=1000, y=800, name="SCV")])
+        observed["units"][3].update(order_id=30, build_queue=[111])
+        offered = lambda: [a for a in candidates(observed).values() if a.get("building") == 111]
+        self.assertFalse(offered())
+        observed["units"][3].update(order_id=85)
+        self.assertTrue(offered())
+        observed["units"].append(unit(32, 111, x=2600, y=1500, completed=False, name="Barracks"))
+        self.assertFalse(offered())
+
     def test_supply_depot_cooldown_keeps_other_types_and_points_available(self):
         observed = state()
         observed["supply"] = {"used": 10, "available": 10}
@@ -699,7 +822,12 @@ class GraphTests(unittest.TestCase):
                 self.assertEqual(set(question["criteria"]), set(branch["candidate_ids"]))
                 self.assertIn("independent recommendation", question["instructions"])
                 for key, description in question["criteria"].items():
-                    self.assertEqual(description, self.actions[key]["label"])
+                    if self.actions[key]["kind"] == "explore":
+                        self.assertIn("toward a destination cell", description)
+                        self.assertIn("Endpoint 256px cell", description)
+                        self.assertNotIn("reveal terrain", description)
+                    else:
+                        self.assertEqual(description, self.actions[key]["label"])
         self.assertIn("No joint probability", self.routing["semantics"])
 
     def test_playbook_guidance_does_not_remove_competing_model_commands(self):

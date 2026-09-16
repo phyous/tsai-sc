@@ -62,7 +62,8 @@ python -m tsai_sc.boot --mission strongarm
 python -m tsai_sc.run \
   --env-file "$HOME/.config/tsai-sc/env" \
   --run-dir runs/my-attempt \
-  --max-requests 400 --max-seconds 1200
+  --max-requests 1800 --max-seconds 3600 \
+  --decision-seconds 3 --combat-decision-seconds 0.5
 
 python -m tsai_sc.render runs/my-attempt \
   --output recordings/strongarm.mp4 --speed 4 --fps 30
@@ -76,6 +77,10 @@ mission through the game menus, use `python -m tsai_sc.boot --restart`.
 Alternatively, provide `TYPESAFE_API_KEY` in the environment. Requests go only to
 TypeSafe's fixed HTTPS API endpoint. Request limits include retry attempts, and
 there is no substitute policy or fabricated response if the API fails.
+The optional combat interval applies when a visible hostile is within 512 pixels
+of an owned combat unit before or after a command. It shortens the next wait;
+selection and input execution still advance the game. Both intervals and actual
+decision timing are recorded. Omit the flag to use one fixed interval.
 
 Setup downloads a pinned BottleShip revision and verifies the demo bundle's
 SHA-256. It keeps the runtime, game data, logs, and an isolated browser profile
@@ -146,11 +151,18 @@ issuing its order. Mouse clicks are queued against paused position snapshots;
 each click's resulting selection is checked. It supplies up to eight
 squads, four nearest visible focus targets per squad, known costs, prerequisites,
 and tile-aligned construction candidates. Economy commands likewise require the
-exact requested actor after a paused 1 ms selection tap. Ground attack orders
+exact requested actor after a paused 1 ms selection tap; an obscured SCV can be
+recovered with a small selection box, followed by the same exact-actor check.
+Squad selection also checks identity generations to reject reused unit slots.
+Ground attack orders
 use the minimap to avoid turning a ground destination into a click on a building
 sprite; focus fire still clicks a visible target. Exploration geometry uses the squad's
 observed position and map bounds; the game determines terrain passability.
 Recent observed friendly positions help Jev track where it has already moved.
+Persistent 256-pixel visitation cells retain sampled owned combat positions
+throughout the run. Scout choices disclose prior visitation and current
+presence. These samples are not fog coverage or terrain information, and
+revisiting a cell remains available for transit or tactics.
 The harness also remembers up to thirty-two enemy structures actually seen in
 earlier observations and offers up to four recent locations per squad as
 attack-move destinations. Stale sightings are explicitly uncertain, and focus
@@ -171,7 +183,9 @@ Barracks can be rebuilt or expanded to three, with one under construction at a
 time, for the original cost of 150 minerals each. Placement search covers a
 bounded area in every direction around the observed base, avoiding observed
 obstacles and temporarily excluding recently rejected sites. The game validates
-terrain. Infantry weapons level 1 costs 100 minerals and 100 gas; after one
+terrain. Active SCV build orders count as pending construction before the
+building appears, preventing duplicate assignments. Infantry weapons level 1
+costs 100 minerals and 100 gas; after one
 issued upgrade order is accepted, it is no longer offered during that run.
 Acceptance confirms research started, not that it finished. Workers inside refineries,
 unfinished units, and workers already constructing cannot be retasked through

@@ -1,6 +1,6 @@
 # Lessons from developing the harness
 
-These notes describe development attempts through attempt 12 and subsequent
+These notes describe development attempts through attempt 13 and subsequent
 changes and probes. They do not establish a combat victory or a measured improvement in
 win rate. Code checks, controlled game tests, and strategy hypotheses provide
 different kinds of evidence.
@@ -233,3 +233,58 @@ different kinds of evidence.
     input checks are separate from Jev's recorded gameplay and establish no
     combat victory. See [input translation](../tsai_sc/controller.py) and
     [control regressions](../tests/test_controller.py).
+
+14. **Exploration needs lasting spatial feedback.** Attempt 13 established
+    mining, started the weapons upgrade, grew its army, and damaged armed
+    defenders in small skirmishes. It did not find the rebel base before the
+    development run was stopped. Through call 111, sampled owned combat
+    positions occupied 44 of 96 cells on a 256-pixel grid. Calls 99–111 crossed
+    already sampled cells without adding another cell. Units were moving;
+    this was not evidence of stationary pathfinding failure. Revisiting ground
+    can also be necessary transit.
+
+    The previous observation retained only 64 history events and 24 coarse
+    squad-center bins. Persistent visitation now uses owned combat snapshots
+    throughout the run, with separate prior visits and current presence.
+    Scout choices describe their endpoint's recorded visitation without
+    removing any destination. These are sampled positions, not fog coverage,
+    passability, cleared territory, or evidence of enemy absence. No route or
+    unseen enemy coordinates are supplied.
+
+    Frozen-state probes initially still preferred some revisits. Describing the
+    endpoint first and explicitly prioritizing expanded sampled coverage over
+    repeated traversal changed saved calls 110 and 123 to previously unsampled
+    destination cells. These API probes issued no game inputs and do not
+    establish a successful mission or improved win rate.
+
+15. **Reaction time includes input execution.** In attempt 13, calls 80 and 82
+    spent 75 and 64 original game frames selecting units before their focus
+    targets were no longer visible. The fixed three-second wait then added
+    another 55–56 frames. Call 82 lost two completed Marines during input and
+    another during the following wait. An optional shorter observation interval
+    during visible nearby combat reduces the waiting component; it does not
+    choose commands or establish that those losses would have been prevented.
+    Selection overhead remains a separate issue to measure.
+
+    A control-group experiment did not yield a working recall through this
+    runtime: after Ctrl+digit assignment and selecting a Command Center,
+    pressing the digit left the Command Center selected. A left-Ctrl variant
+    also failed. Exact-selection checks rejected the result, but fallback
+    selection added overhead (59 frames versus 53 in the measured case).
+    The unproven cache was removed. Its failure does not establish whether the
+    underlying cause is in the runtime or original demo's input handling.
+
+16. **Obscured workers and pending construction need explicit handling.** Calls
+    144–152 repeatedly tried to select SCV 1676 behind a Supply Depot. The
+    exact-actor guard rejected the Depot each time, so no gather order reached
+    the wrong unit. Earlier, separate workers received duplicate construction
+    tasks while their predecessors were still approaching the site with build
+    order 30. Counting only existing unfinished structures missed that period.
+    Pending construction must require an active build order and matching
+    queued building: failed builders can retain a stale queue while mining.
+
+    A separate live recovery probe reproduced the obscured worker: the point
+    click selected Depot 1589, then one ordinary 8×8-pixel selection drag selected
+    exactly SCV 1676. A mineral right-click produced gather order 85 targeting
+    mineral 1681. The fallback retains the exact-actor guard. Pending-build
+    tests distinguish active order 30/33 from stale queues on mining workers.

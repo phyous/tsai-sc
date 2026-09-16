@@ -16,6 +16,7 @@ from typing import Literal, NotRequired, TypedDict
 
 from .controller import BUILDING_ORDERS, GAS_ORDERS, MINERAL_ORDERS, building_sites, depot_sites, supply
 from .battle import recent_battle_outcomes
+from .exploration import endpoint_fact, visitation_summary
 from .game import BASE_COMBAT_STATS
 
 
@@ -104,6 +105,43 @@ _ATTACK_CAPABLE_WORKERS = frozenset({7, 41, 64})
 
 class CombatStateError(ValueError):
     pass
+
+
+EXPLORATION_GUIDANCE = (
+    "Searching for an unknown enemy objective requires expanding coverage. Prefer a destination without prior owned-combat samples over another pass through sampled ground, unless current danger or necessary transit justifies the revisit. "
+    "Use persistent visitation_summary and each exploration endpoint's recorded samples; repeating a familiar corridor is movement but does not expand sampled coverage. "
+    "Revisiting a sampled cell can be useful for transit or tactics; it is not forbidden. Current presence is separate from an earlier visit. "
+    "These 256px samples do not establish fog coverage, cleared territory, enemy absence, or passability; no path between samples is inferred."
+)
+
+
+def _endpoint_description(fact):
+    if fact["previously_occupied"]:
+        prior = f"prior owned-combat sample at frame {fact['last_prior_observed_frame']}"
+    elif fact["currently_occupied"]:
+        prior = "first recorded owned-combat sample is current"
+    else:
+        prior = "no recorded owned-combat sample"
+    column, row = fact["cell"]
+    return (f"Endpoint 256px cell [{column},{row}]: {prior}; "
+            f"current owned-combat sample: {'yes' if fact['currently_occupied'] else 'no'}")
+
+
+def _exploration_criterion(action, fact, members):
+    """Describe recorded destination history without promising newly revealed terrain."""
+    formation = _formation(members)
+    actor = f"{action['squad']} ({len(members)} units; {formation['core_count']} within 192px of one member)"
+    direction = _direction(_center(members), action["point"])
+    if fact["previously_occupied"]:
+        destination = "a previously sampled destination cell"
+    elif fact["currently_occupied"]:
+        destination = "a destination cell with a current owned-combat sample and no prior sample"
+    else:
+        destination = "a destination cell with no recorded owned-combat sample"
+    point = action["point"]
+    return (f"{actor}: attack-move {direction} toward {destination} at ({point['x']}, {point['y']}); "
+            + _endpoint_description(fact)
+            + "; engage encountered enemies. Revisits can serve transit or tactics; sampled cells do not establish fog coverage or passability.")
 
 
 def _point(unit: dict) -> Point:
@@ -398,7 +436,17 @@ def _economy_candidates(state: dict, own: list[dict], actions: dict[str, CombatA
                 "label": "Start infantry weapons level 1 at the observed Engineering Bay (100 minerals, 100 gas). Improves infantry weapon damage when research completes; does not immediately finish the upgrade or change army orders.",
                 "units": [bay["id"]], "unit": bay["id"], "upgrade": "infantry_weapons", "mineral_cost": 100, "gas_cost": 100,
             })
-    depot_underway = any(unit["type_id"] == 109 and unit.get("completed") is not True for unit in own)
+    # An accepted SCV build order precedes creation of the building's CUnit.
+    # Queue bytes can remain stale after failure, so require an active build
+    # order as well; a mining SCV with an old queue is not pending construction.
+    pending_builds = {
+        building: sum(unit["type_id"] == 7 and unit.get("completed") is True
+                      and unit.get("order_id") in {30, 33} and building in unit.get("build_queue", [])
+                      for unit in own)
+        for building in (109, 111)
+    }
+    depot_underway = (pending_builds[109] > 0
+                     or any(unit["type_id"] == 109 and unit.get("completed") is not True for unit in own))
     failed = {(event["building"], event["point"]["x"], event["point"]["y"]) for event in _failed_build_sites(state, history)}
     if amount >= 100 and capacity - used <= 3 and not depot_underway and available_workers:
         available_sites = [point for point in depot_sites(state) if (109, point["x"], point["y"]) not in failed]
@@ -409,7 +457,8 @@ def _economy_candidates(state: dict, own: list[dict], actions: dict[str, CombatA
                 "units": [worker["id"]], "unit": worker["id"], "building": 109, "point": dict(point), "mineral_cost": 100,
             })
     barracks = [unit for unit in own if unit["type_id"] == 111]
-    if (amount >= 150 and len(barracks) < 3 and not any(unit.get("completed") is not True for unit in barracks)
+    if (amount >= 150 and len(barracks) + pending_builds[111] < 3 and not pending_builds[111]
+            and not any(unit.get("completed") is not True for unit in barracks)
             and available_workers):
         available_sites = [point for point in building_sites(state, 111) if (111, point["x"], point["y"]) not in failed]
         for index, point in enumerate(available_sites[:2], 1):
@@ -641,11 +690,14 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
                 entry[key] = event[key]
         if "command" in event:
             entry["label"] = event["command"]
-        if isinstance(event.get("squad_centers"), list):
+        observed_frame = event.get("frame")
+        if (isinstance(event.get("squad_centers"), list) and type(observed_frame) is int
+                and 0 <= observed_frame <= state["frame"]):
             for position in event["squad_centers"]:
                 if isinstance(position, dict) and type(position.get("x")) is int and type(position.get("y")) is int:
                     key = (position["x"] // 128, position["y"] // 128)
-                    observed_positions[key] = {"x": position["x"], "y": position["y"], "observed_frame": event.get("frame")}
+                    if key not in observed_positions or observed_frame >= observed_positions[key]["observed_frame"]:
+                        observed_positions[key] = {"x": position["x"], "y": position["y"], "observed_frame": observed_frame}
         if entry and entry.get("kind") != CombatKind.CONTINUE.value:
             recent.append(entry)
     exploration_orders = [event for event in recent if event.get("kind") in {"explore", "attack_move"} and isinstance(event.get("point"), dict)][-12:]
@@ -691,12 +743,21 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
         "unfinished_owned_buildings": sum(unit.get("completed") is not True for unit in own if 106 <= unit["type_id"] <= 173),
         "visible_enemies": len(enemies),
     }
+    # Full history is intentional: short action context must not erase a visit.
+    visitation = visitation_summary(state, history, mission.combat_types)
+    exploration_details = {
+        key: {"endpoint_visitation": endpoint_fact(visitation, action["point"])}
+        for key, action in actions.items() if action["kind"] == CombatKind.EXPLORE.value
+    }
     model_state = {
         "game": "Original StarCraft shareware combat mission", "mission": mission.name,
         "objectives": list(mission.objectives), "observed_frame": state.get("frame"),
         "mission_playbook": list(MISSION_PLAYBOOK),
         "combat_guidance": COMBAT_GUIDANCE,
         "recent_battle_outcomes": recent_battle_outcomes(state, history, mission.combat_types),
+        "visitation_summary": visitation,
+        "exploration_guidance": EXPLORATION_GUIDANCE,
+        "available_command_details": exploration_details,
         "map_pixels": {"width": _bounds(state)[0], "height": _bounds(state)[1]},
         "coordinates": "x increases east; y increases south. Map boundaries are known; unseen enemy locations are not.",
         "resources": {key: state[key] for key in ("minerals", "gas", "supply") if key in state},
@@ -725,7 +786,7 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
                                     if unit["type_id"] in {106, 111, 113} and unit.get("completed") is True and unit.get("visible") is True],
         "recent_model_orders": recent[-8:],
         "previously_ordered_exploration_destinations": exploration_orders,
-        "previously_observed_friendly_positions": list(observed_positions.values())[-24:],
+        "previously_observed_friendly_positions": sorted(observed_positions.values(), key=lambda item: item["observed_frame"])[-24:],
         "current_orders_are_authoritative": "Standing guard means idle until an enemy enters range; it is not an ongoing march. Follow 49 is a unit-target movement order and can remain active after getting close. Engine orders describe intent, not measured velocity. Previously accepted movement may have ended. Continue preserves current activities, including idle units; a production or other-squad command also preserves a formed force's current advance.",
         "observation_limits": "Only owned units and currently visible hostiles/allies, plus up to32 recorded prior visible enemy structures with explicitly uncertain current presence. Attack-move options may revisit the four most recent structure sightings; focus fire still requires current visibility. Focus options use the four nearest visible enemies per squad; squad summaries show the eight nearest. Up to eight nearby squads of twelve are offered. Candidate geometry does not reveal terrain passability; the original engine resolves movement. No never-observed base coordinates or winning route are provided.",
     }
@@ -743,7 +804,13 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
         "instructions": "Choose the available gameplay command that makes the most useful progress toward completing the mission from the CURRENT observed state. Use combat_guidance: compare local armed threats, composition, HP and range; a coherent formation does not guarantee enough strength. Handle immediate armed defenders before durable unarmed buildings and reconsider approaches associated with recent observed losses. Compare income, production, and exploration too. Continue means issue no command: judge its effect from current orders, not historical acceptance. A worker or production command can run concurrently with existing military orders. Avoid reversing a productive advance without a tactical reason. Unknown enemy locations remain unknown. All options are real gameplay actions; choose one.",
         "criteria": {key: action["label"] for key, action in actions.items()},
     }}
+    questions["action"]["instructions"] += " " + EXPLORATION_GUIDANCE
     for key, action in actions.items():
+        if action["kind"] == CombatKind.EXPLORE.value:
+            questions["action"]["criteria"][key] = _exploration_criterion(
+                action, exploration_details[key]["endpoint_visitation"],
+                [own_by_id[uid] for uid in action["units"]],
+            )
         if action["kind"] == CombatKind.CONTINUE.value:
             questions["action"]["criteria"][key] = (
                 f"Issue no command; preserve current activities: {current_activity['combat_units_moving_or_attacking']} combat units with move/follow/attack orders (not measured movement), "
@@ -802,6 +869,7 @@ def graph_request_for(state: dict, actions: dict[str, CombatAction], history: li
         "instructions": "Choose which kind of gameplay command would make the most useful progress toward completing the mission from the CURRENT observed state. Use mission_playbook and combat_guidance: establish income, maintain Marine production, and compare local armed defenders, HP, composition, range and recent_battle_outcomes before committing a force. Handle immediate armed threats before durable unarmed buildings; Marines should preserve range against Firebat splash. Check each squad's formation, not its name or total scattered army. At least 8 combat units in a measured 192px core means already assembled, not sufficient strength against the observed defense. When strength permits, preserve its advance while replacements are produced or smaller groups regroup. A distant reinforcement does not require reversing it. After costly observed losses, reconsider the approach, rebuild or reinforce; current danger can justify retreat. Compare each category's best available command regardless of option count. Continue starts no new activity; production and commands to other squads preserve an existing advance. Select a category; independent companion questions recommend its concrete commands.",
         "criteria": {},
     }}
+    questions["intent"]["instructions"] += " " + EXPLORATION_GUIDANCE
     routing = graph_routing(actions)
     flat_criteria = flat_questions["action"]["criteria"]
     for category, branch in routing["branches"].items():
@@ -816,6 +884,8 @@ def graph_request_for(state: dict, actions: dict[str, CombatAction], history: li
                 "instructions": f"Assuming a {category.lower()} command is to be issued, choose the available concrete command that best advances the mission from current observations, mission_playbook and combat_guidance. Compare local armed threats and range before durable unarmed buildings; avoid close-range Firebat splash and repeating approaches associated with recent observed losses at comparable strength. Maintain income and production. A measured core of at least 8 is already assembled but is not automatically strong enough for the defense. A return to base is a withdrawal, not required assembly. After losses, reinforce; health and visible danger can justify retreat. This is an independent recommendation, used only if the separate intent decision selects {category}. Compare actual members, formation, targets, health, current orders, resources, and observed positions. Preserve a productive supported advance unless there is a tactical reason to replace it; other-squad commands and production run concurrently. Last-seen structures remain uncertain and never-observed locations unknown. Choose one actual gameplay command.",
                 "criteria": {key: flat_criteria[key] for key in candidate_ids},
             }
+            if category == "Explore":
+                questions[question_id]["instructions"] += " " + EXPLORATION_GUIDANCE
     return model_state, questions, routing
 
 

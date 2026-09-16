@@ -326,16 +326,26 @@ class InputAdapter:
         self.bridge.pause()
         actual = read_selection(self.bridge.read_memory)
         requested = set(action['units'])
+        original = {u['id']: u for u in state['units']}
+        expected_generations = {uid: action.get('unit_generations', {}).get(str(uid), original.get(uid, {}).get('generation'))
+                                for uid in requested}
 
         def available_units(snapshot):
             return {u['id']: u for u in snapshot['units'] if u['id'] in requested
-                    and u['owner'] == state['player_id'] and u['completed'] and u['visible']}
+                    and u['owner'] == state['player_id'] and u['completed'] and u['visible']
+                    and (expected_generations[u['id']] is None or u.get('generation') == expected_generations[u['id']])}
+
+        def finish(actual, available, method, checks):
+            result = {'selected_units': actual, 'available_requested_units': sorted(available),
+                      'selection_method': method, 'selection_checks': checks}
+            if all(type(unit.get('generation')) is int for unit in available.values()):
+                result['selected_unit_generations'] = {str(uid): unit['generation'] for uid, unit in available.items()}
+            return result
 
         fresh = read_state(self.bridge.read_memory)
         available = available_units(fresh)
         if actual and set(actual) == set(available):
-            return {'selected_units': actual, 'available_requested_units': sorted(available),
-                    'selection_method': 'already_selected'}
+            return finish(actual, available, 'already_selected', [])
         checks = []
         missed_clicks = set()
         # A missed/toggled click may be retried once, but never accepted as a
@@ -394,8 +404,7 @@ class InputAdapter:
             available = available_units(fresh)
             actual = read_selection(self.bridge.read_memory)
             if actual and set(actual) == set(available):
-                return {'selected_units': actual, 'available_requested_units': sorted(available),
-                        'selection_method': 'shift_click', 'selection_checks': checks}
+                return finish(actual, available, 'shift_click', checks)
         return {'issued': False, 'inputs': list(self.inputs),
                 'reason': 'Could not select every surviving visible requested unit',
                 'selected_units': actual, 'available_requested_units': sorted(available),
@@ -485,8 +494,27 @@ class InputAdapter:
             self._settle()
             self.bridge.pause()
             selected = read_selection(self.bridge.read_memory)
+            selection_checks = [{'method': 'click', 'selected_units': list(selected)}]
+            if selected != [actor['id']] and actor['type_id'] == 7:
+                # An SCV can stand behind the roof of its finished building.
+                # Replace the wrong building selection with one tiny ordinary
+                # box, then retain the same exact-actor acceptance guard.
+                fresh = read_state(self.bridge.read_memory)
+                recovered = next((u for u in fresh['units'] if u['id'] == actor['id']
+                                  and u['owner'] == state['player_id'] and u['completed'] and u['visible']
+                                  and u.get('generation') == actor.get('generation')), None)
+                point = game_to_screen(recovered['x'], recovered['y'], fresh['camera'], height=312) if recovered else None
+                if point is not None:
+                    self._queue_input('drag', max(1, point['x'] - 4), max(1, point['y'] - 4),
+                                      min(638, point['x'] + 4), min(310, point['y'] + 4), 0)
+                    self.bridge.resume()
+                    self._settle()
+                    self.bridge.pause()
+                    selected = read_selection(self.bridge.read_memory)
+                    selection_checks.append({'method': 'box_drag', 'selected_units': list(selected)})
             if selected != [actor['id']]:
                 return {'issued': False, 'inputs': list(self.inputs), 'selected_units': selected,
+                        'selection_checks': selection_checks,
                         'reason': 'Could not select the exact requested actor'}
             self.bridge.resume()
             if action['kind'] == 'train':
@@ -514,6 +542,7 @@ class InputAdapter:
             else:
                 raise ValueError('Unsupported action')
             self._input('move', 320, 280)  # Do not leave the pointer on a scroll edge.
-            return {'issued': True, 'inputs': list(self.inputs), 'selected_units': selected}
+            return {'issued': True, 'inputs': list(self.inputs), 'selected_units': selected,
+                    'selection_checks': selection_checks}
         finally:
             self.bridge.pause()
