@@ -72,21 +72,55 @@ test('capture reuses one attachment and submits only the fixed read-only express
   const calls:any[]=[];
   const session={send:async (...args:any[])=>{
     calls.push(args);
-    if(args[0]==='Target.getTargets') return {result:{targetInfos:[{targetId:'game-worker',type:'worker',url:'http://localhost:5174/src/worker/emulator.worker.ts?worker_file&type=module'}]}};
+    if(args[0]==='Target.getTargetInfo') return {result:{targetInfo:{targetId:'game-page',type:'page',url:'http://localhost:5174/?game=dev'}}};
+    if(args[0]==='Target.getTargets') return {result:{targetInfos:[{targetId:'game-worker',parentId:'game-page',type:'worker',url:'http://localhost:5174/src/worker/emulator.worker.ts?worker_file&type=module'}]}};
     if(args[0]==='Target.attachToTarget') return {result:{sessionId:'worker-session'}};
     return {result:{result:{value:fixture()}}};
   }};
   const capture=new CpuCapture();
   await capture.capture(session); await capture.capture(session);
   expect(calls.filter(call=>call[0]==='Target.attachToTarget')).toHaveLength(1);
+  expect(calls.filter(call=>call[0]==='Target.setAutoAttach')).toEqual([
+    ['Target.setAutoAttach',{autoAttach:true,waitForDebuggerOnStart:false,flatten:true}]]);
   expect(calls.filter(call=>call[0]==='Target.setDiscoverTargets')).toHaveLength(1);
   expect(calls.filter(call=>call[0]==='Runtime.enable')).toEqual([['Runtime.enable',{},'worker-session']]);
-  expect(calls.slice(0,4).map(call=>call[0])).toEqual([
-    'Target.setDiscoverTargets','Target.getTargets','Target.attachToTarget','Runtime.enable']);
+  expect(calls.slice(0,6).map(call=>call[0])).toEqual([
+    'Target.setAutoAttach','Target.setDiscoverTargets','Target.getTargetInfo','Target.getTargets','Target.attachToTarget','Runtime.enable']);
   const evaluations=calls.filter(call=>call[0]==='Runtime.evaluate');
   expect(evaluations).toHaveLength(2);
   for(const call of evaluations) {
     expect(call[1]).toEqual({expression:CPU_FRAME_EXPRESSION,returnByValue:true,awaitPromise:false});
     expect(call[2]).toBe('worker-session');
   }
+});
+
+test('fresh blank-URL worker attaches only through its current page parent and reset rediscovers', async () => {
+  const attached:string[]=[];
+  let generation=1;
+  const session={send:async (command:string,args:any)=>{
+    if(command==='Target.getTargetInfo') return {result:{targetInfo:{targetId:'game-page',type:'page',url:'http://localhost:5174/?game=dev'}}};
+    if(command==='Target.getTargets') return {result:{targetInfos:[
+      {targetId:`emulator-${generation}`,parentId:'game-page',type:'worker',url:''},
+      {targetId:'nested',parentId:`emulator-${generation}`,type:'worker',url:''},
+      {targetId:'other-tab-worker',parentId:'other-page',type:'worker',url:'http://localhost:5174/src/worker/emulator.worker.ts?worker_file'},
+    ]}};
+    if(command==='Target.attachToTarget') {attached.push(args.targetId);return {result:{sessionId:`session-${generation}`}};}
+    return {result:{result:{value:fixture()}}};
+  }};
+  const capture=new CpuCapture();
+  await capture.capture(session); generation=2; capture.reset(); await capture.capture(session);
+  expect(attached).toEqual(['emulator-1','emulator-2']);
+});
+
+test('capture refuses ambiguous direct workers and non-BottleShip parent pages', async () => {
+  let pageUrl='http://localhost:5174/?game=dev';
+  const session={send:async (command:string)=>{
+    if(command==='Target.getTargetInfo') return {result:{targetInfo:{targetId:'game-page',type:'page',url:pageUrl}}};
+    if(command==='Target.getTargets') return {result:{targetInfos:[1,2].map(i=>({targetId:`w${i}`,parentId:'game-page',type:'worker',url:''}))}};
+    if(command==='Target.attachToTarget') throw Error('Must not attach to an ambiguous or unrelated worker');
+    return {};
+  }};
+  await expect(new CpuCapture().capture(session)).rejects.toThrow('ambiguous');
+  pageUrl='https://example.com/';
+  await expect(new CpuCapture().capture(session)).rejects.toThrow('local BottleShip page');
 });

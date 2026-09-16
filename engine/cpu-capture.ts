@@ -77,10 +77,20 @@ export class CpuCapture {
     if (!this.workerSession) {
       // Follow BottleShip's worker transport initialization explicitly, so the
       // first capture does not depend on an earlier diagnostic attachment.
+      await session.send('Target.setAutoAttach',{autoAttach:true,waitForDebuggerOnStart:false,flatten:true});
       await session.send('Target.setDiscoverTargets',{discover:true});
+      const current = await session.send('Target.getTargetInfo');
+      const page = current.result?.targetInfo;
+      if (page?.type !== 'page' || typeof page.targetId !== 'string'
+          || !/^http:\/\/localhost:5174\/(?:\?|$)/.test(page.url ?? ''))
+        throw Error('Capture requires the local BottleShip page');
       const targets = await session.send('Target.getTargets');
       const candidates = (targets.result?.targetInfos ?? []).filter((target: any) =>
-        target.type === 'worker' && target.url.startsWith('http://localhost:5174/src/worker/emulator.worker.ts?'));
+        // Chrome can leave a fresh worker's URL/title empty until attached.
+        // Parent ownership still distinguishes the page's emulator from its
+        // nested workers and workers belonging to other tabs.
+        target.type === 'worker' && target.parentId === page.targetId
+        && (target.url === '' || target.url?.startsWith('http://localhost:5174/src/worker/emulator.worker.ts?')));
       if (candidates.length !== 1) throw Error('Emulator worker is ambiguous or unavailable');
       const attached = await session.send('Target.attachToTarget',{targetId:candidates[0].targetId,flatten:true});
       this.workerSession = attached.result?.sessionId;
