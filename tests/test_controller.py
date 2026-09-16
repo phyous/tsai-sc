@@ -1,0 +1,433 @@
+"""Behavior checks for legal command menus and the original input path."""
+import copy
+import struct
+import unittest
+from unittest.mock import patch
+
+from tsai_sc.controller import InputAdapter, candidates, depot_sites, request_for, supply, verify_command
+from tsai_sc.game import CAMERA, UNIT_NAMES
+
+
+def unit(index, kind, x, y, *, owner=6, completed=True, visible=True, order=3, queue=()):
+    return {
+        'id': index, 'type_id': kind, 'owner': owner, 'x': x, 'y': y,
+        'completed': completed, 'visible': visible, 'order_id': order,
+        'build_queue': list(queue), 'type': UNIT_NAMES.get(kind, f'Unit {kind}'),
+        'hp': 60, 'remaining_build_time': 0,
+    }
+
+
+def mission():
+    return {
+        'player_id': 6, 'minerals': 150, 'gas': 0,
+        'frame': 329,
+        'objective_progress': {'supply_depots': {'current': 1, 'target': 3},
+                               'refineries': {'current': 0, 'target': 1},
+                               'gas': {'current': 0, 'target': 100}},
+        'camera': {'x': 0, 'y': 384},
+        'map': {'width_tiles': 64, 'height_tiles': 64},
+        'units': [
+            unit(1, 7, 733, 500), unit(2, 106, 576, 528),
+            unit(3, 109, 912, 480), unit(4, 176, 464, 352, owner=11),
+            unit(5, 188, 320, 608, owner=11),
+        ] + [unit(20 + i, 0, 900 + i * 10, 1200) for i in range(16)],
+    }
+
+
+class Bridge:
+    def __init__(self, camera=(0, 384)):
+        self.camera_position = camera
+        self.calls = []
+        self.running = False
+        self.fail_on = None
+        self.reject_on = None
+        self.input_running = []
+        self.pan_to = None
+
+    def rpc(self, command, *args):
+        self.calls.append((command, *args))
+        self.input_running.append((command, self.running))
+        if command == self.fail_on:
+            raise RuntimeError('input failed')
+        if command == self.reject_on:
+            return {'ok': False}
+        if command == 'clickHold' and args[1] >= 348 and self.pan_to is not None:
+            self.camera_position = self.pan_to
+
+    def read_memory(self, address, length):
+        if (address, length) != (CAMERA, 8):
+            raise AssertionError('Adapter read outside camera coordinates')
+        return struct.pack('<II', *self.camera_position)
+
+    def resume(self):
+        self.running = True
+        self.calls.append(('resume',))
+
+    def pause(self):
+        self.running = False
+        self.calls.append(('pause',))
+
+
+class ControllerTests(unittest.TestCase):
+    def test_supply_accounts_for_queue_and_incomplete_depots(self):
+        state = mission()
+        self.assertEqual(supply(state), (17, 18))
+        state['units'][1]['build_queue'] = [7]
+        state['units'].append(unit(6, 109, 700, 700, completed=False))
+        self.assertEqual(supply(state), (18, 18))
+        state['units'][-1]['completed'] = True
+        self.assertEqual(supply(state), (18, 26))
+
+    def test_authoritative_supply_overrides_unit_count_estimate(self):
+        state = mission()
+        state['supply'] = {'used': 18, 'available': 18}
+        self.assertEqual(supply(state), (18, 18))
+        self.assertNotIn('train_scv', candidates(state))
+
+    def test_costs_and_existing_orders_gate_commands(self):
+        state = mission()
+        initial = candidates(state)
+        self.assertIn('mine_1', initial)
+        self.assertIn('train_scv', initial)
+        self.assertIn('build_refinery', initial)
+        self.assertTrue(any(key.startswith('depot_') for key in initial))
+        state['minerals'] = 0
+        state['units'][0]['order_id'] = 87
+        self.assertEqual(list(candidates(state)), ['wait'])
+
+    def test_busy_builder_is_not_retasked(self):
+        for order in (30, 33, 34, 35):
+            with self.subTest(order=order):
+                state = mission()
+                state['units'][0]['order_id'] = order
+                offered = candidates(state)
+                self.assertFalse(any(action.get('unit') == 1 for action in offered.values()))
+
+    def test_incomplete_and_hidden_workers_are_not_click_targets(self):
+        # Original demo gas harvesting hides the SCV sprite while order83 runs.
+        for attrs in ({'completed': False}, {'visible': False, 'order_id': 83}):
+            with self.subTest(attrs=attrs):
+                state = mission()
+                state['units'][0].update(attrs)
+                offered = candidates(state)
+                self.assertFalse(any(action.get('unit') == 1 for action in offered.values()))
+
+    def test_gas_requires_finished_refinery(self):
+        state = mission()
+        refinery = unit(6, 110, 320, 608, completed=False)
+        state['units'].append(refinery)
+        self.assertNotIn('gas_1', candidates(state))
+        self.assertNotIn('build_refinery', candidates(state))
+        refinery['completed'] = True
+        self.assertEqual(candidates(state)['gas_1']['target'], 6)
+        state['units'][0]['order_id'] = 83
+        self.assertNotIn('gas_1', candidates(state))
+
+    def test_worker_cap_includes_hidden_gas_workers(self):
+        state = mission()
+        state['supply'] = {'used': 24, 'available': 34}
+        state['units'].extend(unit(40 + i, 7, 320, 608, visible=False, order=83) for i in range(7))
+        self.assertNotIn('train_scv', candidates(state))
+
+    def test_completed_and_incomplete_depots_count_toward_build_limit(self):
+        state = mission()
+        state['units'].extend([
+            unit(6, 109, 752, 640),
+            unit(7, 109, 880, 640, completed=False),
+        ])
+        self.assertFalse(any(key.startswith('depot_') for key in candidates(state)))
+
+    def test_depot_centers_align_footprint_to_tiles_and_avoid_blockers(self):
+        state = mission()
+        points = depot_sites(state)
+        self.assertTrue(points)
+        for point in points:
+            self.assertEqual((point['x'] - 48) % 32, 0)
+            self.assertEqual((point['y'] - 32) % 32, 0)
+        blocked = copy.deepcopy(state)
+        blocked['units'].append(unit(6, 109, **points[0]))
+        self.assertNotIn(points[0], depot_sites(blocked))
+
+    def adapter(self, bridge):
+        adapter = InputAdapter(bridge)
+        adapter._settle = lambda *args: None
+        return adapter
+
+    def execute(self, adapter, state, action, fresh=None):
+        with patch('tsai_sc.controller.read_state', return_value=fresh or state) as read:
+            result = adapter.execute(state, action)
+        self.assertEqual(read.call_count, 1)
+        return result
+
+    def test_refinery_click_uses_upper_left_corner_not_geyser_center(self):
+        bridge = Bridge()
+        adapter = self.adapter(bridge)
+        state = mission()
+        state['units'][0].update(x=400, y=500)
+        action = candidates(state)['build_refinery']
+        result = self.execute(adapter, state, action)
+        self.assertTrue(result['issued'])
+        # Live original-engine regression: center(320,224) erroneously placed
+        # the ghost at(384,256); correct cursor coordinate is(256,192).
+        self.assertIn(('clickHold', 256, 192, 100, 0), bridge.calls)
+        self.assertNotIn(('clickHold', 320, 224, 100, 0), bridge.calls)
+        self.assertIn(('keyHold', 'r', 60), bridge.calls)
+        self.assertEqual(bridge.calls[-1], ('pause',))
+        self.assertFalse(bridge.running)
+
+    def test_gather_right_clicks_target_without_build_offset(self):
+        bridge = Bridge()
+        adapter = self.adapter(bridge)
+        state = mission()
+        state['units'][0].update(x=400, y=500)
+        state['units'][3].update(x=480, y=576)
+        self.execute(adapter, state, candidates(state)['mine_1'])
+        self.assertIn(('clickHold', 480, 192, 100, 1), bridge.calls)
+
+    def test_refinery_near_screen_edge_pans_before_opening_build_cursor(self):
+        # Attempt05: geyser center at(64,288) produced upper-left x=0,
+        # touching the scroll edge. Pan first so the whole footprint is safe.
+        bridge = Bridge(camera=(256, 320))
+        bridge.pan_to = (0, 384)
+        state = mission()
+        state['camera'] = {'x': 256, 'y': 320}
+        state['units'][0].update(x=400, y=500)
+        self.execute(self.adapter(bridge), state, candidates(state)['build_refinery'])
+        pan = ('clickHold', 26, 386, 100, 0)
+        self.assertIn(pan, bridge.calls)
+        self.assertLess(bridge.calls.index(pan), bridge.calls.index(('keyHold', 'b', 60)))
+        self.assertIn(('clickHold', 256, 192, 100, 0), bridge.calls)
+        self.assertNotIn(('clickHold', 0, 256, 100, 0), bridge.calls)
+
+    def test_build_footprint_has_larger_camera_margin_than_unit_target(self):
+        bridge = Bridge(camera=(256, 384))
+        bridge.pan_to = (0, 384)
+        adapter = self.adapter(bridge)
+        self.assertEqual(adapter.focus(320, 608), {'x': 64, 'y': 224})
+        self.assertEqual(bridge.calls, [])
+        self.assertEqual(adapter.focus(320, 608, margin_x=88, margin_y=60), {'x': 320, 'y': 224})
+        self.assertEqual(bridge.calls, [('clickHold', 26, 386, 100, 0)])
+
+    def test_actor_is_refreshed_and_selected_while_paused(self):
+        bridge = Bridge()
+        adapter = self.adapter(bridge)
+        state = mission()
+        state['units'][0].update(x=400, y=500)
+        state['units'][3].update(x=480, y=576)
+        fresh = copy.deepcopy(state)
+        fresh['units'][0].update(x=420, y=510)
+        self.execute(adapter, state, candidates(state)['mine_1'], fresh)
+        self.assertIn(('clickHold', 420, 126, 100, 0), bridge.calls)
+        self.assertNotIn(('clickHold', 400, 116, 100, 0), bridge.calls)
+        self.assertIn(('clickHold', False), bridge.input_running)
+        # With the actor already visible there must be no game input before its
+        # fresh selection. Escape used to cancel the previously selected unit.
+        self.assertEqual(bridge.calls[:3], [
+            ('resume',), ('pause',), ('clickHold', 420, 126, 100, 0),
+        ])
+
+    def test_new_commands_never_send_escape_or_blanket_reset_keys(self):
+        # Real attempt03 regression: unconditional Escape canceled the selected
+        # CC queue (refunding50) and interrupted an SCV construction order33.
+        # Each action may send only its own command hotkeys after actor selection.
+        cases = [
+            ({'kind': 'train', 'unit': 2}, ['s']),
+            ({'kind': 'gather', 'unit': 1, 'target': 4}, []),
+            ({'kind': 'build', 'unit': 1, 'building': 110,
+              'point': {'x': 320, 'y': 608}}, ['b', 'r']),
+            ({'kind': 'build', 'unit': 1, 'building': 109,
+              'point': {'x': 336, 'y': 608}}, ['b', 's']),
+        ]
+        for action, expected_keys in cases:
+            with self.subTest(kind=action['kind'], building=action.get('building')):
+                bridge = Bridge()
+                state = mission()
+                state['units'][0].update(x=400, y=500)
+                state['units'][3].update(x=480, y=576)
+                self.execute(self.adapter(bridge), state, action)
+                keys = [call[1] for call in bridge.calls if call[0] == 'keyHold']
+                self.assertEqual(keys, expected_keys)
+                self.assertNotIn('escape', keys)
+                first_input = next(call for call in bridge.calls if call[0] not in {'resume', 'pause'})
+                self.assertEqual(first_input[0], 'clickHold')
+
+    def test_actor_becoming_hidden_or_incomplete_prevents_command(self):
+        for attrs in ({'visible': False}, {'completed': False}):
+            with self.subTest(attrs=attrs):
+                bridge = Bridge()
+                adapter = self.adapter(bridge)
+                state = mission()
+                state['units'][0].update(x=400, y=500)
+                fresh = copy.deepcopy(state)
+                fresh['units'][0].update(attrs)
+                result = self.execute(adapter, state, candidates(state)['build_refinery'], fresh)
+                self.assertFalse(result['issued'])
+                self.assertEqual(result['reason'], 'Actor became unavailable')
+                self.assertFalse(any(call[0] == 'clickHold' for call in bridge.calls))
+                self.assertNotIn(('keyHold', 'b', 60), bridge.calls)
+                self.assertFalse(bridge.running)
+
+    def test_actor_moving_outside_viewport_prevents_command(self):
+        bridge = Bridge()
+        adapter = self.adapter(bridge)
+        state = mission()
+        state['units'][0].update(x=400, y=500)
+        fresh = copy.deepcopy(state)
+        fresh['units'][0]['x'] = 700
+        result = self.execute(adapter, state, candidates(state)['build_refinery'], fresh)
+        self.assertFalse(result['issued'])
+        self.assertEqual(result['reason'], 'Actor left the viewport')
+        self.assertNotIn(('keyHold', 'b', 60), bridge.calls)
+        self.assertFalse(bridge.running)
+
+    def test_wait_does_not_issue_unselected_commands(self):
+        bridge = Bridge()
+        result = self.adapter(bridge).execute(mission(), {'kind': 'wait'})
+        self.assertEqual(result, {'issued': True, 'inputs': []})
+        self.assertEqual(bridge.calls, [])
+
+    def test_input_failure_still_pauses_runtime(self):
+        bridge = Bridge()
+        bridge.fail_on = 'keyHold'
+        with self.assertRaisesRegex(RuntimeError, 'input failed'):
+            self.execute(self.adapter(bridge), mission(), {'kind': 'train', 'unit': 2})
+        self.assertFalse(bridge.running)
+        self.assertEqual(bridge.calls[-1], ('pause',))
+
+    def test_rejected_selection_prevents_hotkeys_reaching_previous_unit(self):
+        bridge = Bridge()
+        bridge.reject_on = 'clickHold'
+        with self.assertRaisesRegex(RuntimeError, 'unit selection was rejected'):
+            self.execute(self.adapter(bridge), mission(), {'kind': 'train', 'unit': 2})
+        self.assertFalse(any(call[0] == 'keyHold' for call in bridge.calls))
+        self.assertFalse(bridge.running)
+
+
+class CommandFeedbackTests(unittest.TestCase):
+    def test_live_refinery_regression_distinguishes_failed_click_from_build_order(self):
+        before = mission()
+        action = candidates(before)['build_refinery']
+        after = copy.deepcopy(before)
+        # Attempt01: placement cursor rejected the center click, actor stayed3.
+        self.assertFalse(verify_command(before, after, action)['accepted'])
+
+        # Attempt02: corrected upper-left click yielded place-building order30
+        # with refinery110 queued and target at the authentic geyser center.
+        after['units'][0].update(order_id=30, build_queue=[110], order_target={'x': 320, 'y': 608})
+        self.assertTrue(verify_command(before, after, action)['accepted'])
+        after['units'][0]['order_id'] = 33
+        self.assertTrue(verify_command(before, after, action)['accepted'])
+
+    def test_build_can_finish_before_verification(self):
+        before = mission()
+        action = candidates(before)['build_refinery']
+        after = copy.deepcopy(before)
+        after['units'].append(unit(6, 110, 320, 608))
+        self.assertTrue(verify_command(before, after, action)['accepted'])
+        after['units'][-1]['x'] = 800
+        self.assertFalse(verify_command(before, after, action)['accepted'])
+
+    def test_hidden_gas_worker_did_not_accept_mineral_command(self):
+        before = mission()
+        before['units'][0].update(order_id=83, visible=False)
+        action = {'kind': 'gather', 'unit': 1, 'target': 4}
+        after = copy.deepcopy(before)
+        # Attempt02 clicked the last position of an SCV inside the refinery;
+        # gas order83 persisted and therefore did not confirm mineral gathering.
+        self.assertFalse(verify_command(before, after, action)['accepted'])
+        after['units'][0].update(order_id=87, visible=True)
+        self.assertTrue(verify_command(before, after, action)['accepted'])
+        after['units'][0]['order_id'] = 90  # Return minerals remains productive.
+        self.assertTrue(verify_command(before, after, action)['accepted'])
+
+    def test_gas_harvest_acceptance_survives_sprite_hiding_and_return_trip(self):
+        before = mission()
+        before['units'].append(unit(6, 110, 320, 608))
+        action = candidates(before)['gas_1']
+        after = copy.deepcopy(before)
+        self.assertFalse(verify_command(before, after, action)['accepted'])
+        after['units'][0].update(order_id=83, visible=False)
+        self.assertTrue(verify_command(before, after, action)['accepted'])
+        after['units'][0].update(order_id=84, visible=True)
+        self.assertTrue(verify_command(before, after, action)['accepted'])
+
+    def test_training_requires_queue_or_new_worker(self):
+        before = mission()
+        action = candidates(before)['train_scv']
+        after = copy.deepcopy(before)
+        self.assertFalse(verify_command(before, after, action)['accepted'])
+        after['units'][1]['build_queue'] = [7]
+        self.assertTrue(verify_command(before, after, action)['accepted'])
+        after['units'][1]['build_queue'] = []
+        after['units'].append(unit(6, 7, 600, 600))
+        self.assertTrue(verify_command(before, after, action)['accepted'])
+
+    def test_missing_actor_does_not_confirm_command(self):
+        before = mission()
+        action = candidates(before)['mine_1']
+        after = copy.deepcopy(before)
+        after['units'] = [u for u in after['units'] if u['id'] != action['unit']]
+        self.assertFalse(verify_command(before, after, action)['accepted'])
+
+
+class ModelObservationTests(unittest.TestCase):
+    def test_remaining_building_cost_counts_unfinished_structures_as_started(self):
+        state = mission()
+        model, _ = request_for(state, candidates(state), [])
+        self.assertEqual(model['remaining_work']['supply_depots_still_to_start'], 2)
+        self.assertEqual(model['remaining_work']['minerals_needed_for_remaining_buildings'], 300)
+        self.assertEqual(model['remaining_work']['mineral_shortfall'], 150)
+        state['minerals'] = 40
+        state['gas'] = 24
+        state['units'].extend([
+            unit(6, 109, 752, 640, completed=False),
+            unit(7, 110, 320, 608, completed=False),
+        ])
+        model, _ = request_for(state, candidates(state), [])
+        remaining = model['remaining_work']
+        self.assertEqual(remaining['supply_depots_still_to_start'], 1)
+        self.assertEqual(remaining['refineries_still_to_start'], 0)
+        self.assertEqual(remaining['minerals_needed_for_remaining_buildings'], 100)
+        self.assertEqual(remaining['mineral_shortfall'], 60)
+        self.assertEqual(remaining['additional_gas_needed'], 76)
+        # Starting a building does not rewrite completed objective progress.
+        self.assertEqual(model['progress']['supply_depots']['current'], 1)
+        self.assertEqual(model['progress']['refineries']['current'], 0)
+
+    def test_remaining_needs_are_zero_when_resources_and_buildings_suffice(self):
+        state = mission()
+        state['gas'] = 108
+        state['units'].extend([
+            unit(6, 109, 752, 640), unit(7, 109, 880, 640, completed=False),
+            unit(8, 110, 320, 608),
+        ])
+        model, _ = request_for(state, candidates(state), [])
+        remaining = model['remaining_work']
+        for key in ('supply_depots_still_to_start', 'refineries_still_to_start',
+                    'minerals_needed_for_remaining_buildings', 'mineral_shortfall',
+                    'additional_gas_needed'):
+            self.assertEqual(remaining[key], 0)
+
+    def test_current_jobs_and_workforce_counts_describe_actual_orders(self):
+        state = mission()
+        state['units'].extend([
+            unit(6, 7, 500, 600, order=33),
+            unit(7, 7, 520, 600, order=87),
+            unit(8, 7, 320, 608, order=83, visible=False),
+            unit(9, 7, 576, 528, completed=False),
+            unit(10, 7, 100, 100, owner=0, order=87),
+        ])
+        model, _ = request_for(state, candidates(state), [])
+        jobs = {u['id']: u.get('current_job') for u in model['units']}
+        self.assertEqual({key: jobs[key] for key in (1, 6, 7, 8, 9)}, {
+            1: 'idle', 6: 'constructing', 7: 'gathering minerals',
+            8: 'gathering gas', 9: 'being trained',
+        })
+        remaining = model['remaining_work']
+        self.assertEqual(remaining['workers_collecting_minerals'], 1)
+        self.assertEqual(remaining['workers_collecting_gas'], 1)
+        self.assertEqual(remaining['workers_constructing'], 1)
+
+
+if __name__ == '__main__':
+    unittest.main()

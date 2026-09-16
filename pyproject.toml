@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tsai-sc"
+version = "0.1.0"
+description = "TypeSafe Jev plays an original StarCraft shareware mission with recorded decision probabilities"
+requires-python = ">=3.11"
+dependencies = ["Pillow>=10.4,<13"]
+license = "MIT"
+
+[tool.setuptools.packages.find]
+include = ["tsai_sc*"]
