@@ -77,6 +77,13 @@ STRONGARM = MissionConfig(
     allied_players=(2, 6),
 )
 
+MISSION_PLAYBOOK = (
+    "Establish mineral income early by assigning idle SCVs to visible mineral fields; idle workers earn nothing, and training more workers does not assign existing ones.",
+    "Maintain replacements: when affordable, keep idle Barracks producing Marines and maintain supply. Mining and production continue concurrently with army orders; avoid stockpiling minerals while production is idle.",
+    "Concentrate combat power. Coordinate nearby troops and reinforcements instead of sending isolated units into opposition; weigh regrouping against interrupting a productive attack or an urgent defense.",
+    "Explore the unseen map with a supported force while maintaining income and replacements. Follow observed threats and known objectives; use current orders and observed positions to avoid needless reversals. No fixed route is supplied.",
+)
+
 
 class CombatStateError(ValueError):
     pass
@@ -449,6 +456,7 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
     model_state = {
         "game": "Original StarCraft shareware combat mission", "mission": mission.name,
         "objectives": list(mission.objectives), "observed_frame": state.get("frame"),
+        "mission_playbook": list(MISSION_PLAYBOOK),
         "map_pixels": {"width": _bounds(state)[0], "height": _bounds(state)[1]},
         "coordinates": "x increases east; y increases south. Map boundaries are known; unseen enemy locations are not.",
         "resources": {key: state[key] for key in ("minerals", "gas", "supply") if key in state},
@@ -542,7 +550,7 @@ def graph_request_for(state: dict, actions: dict[str, CombatAction], history: li
     }
     questions = {"intent": {
         "type": "choice",
-        "instructions": "Choose which kind of gameplay command would make the most useful progress toward completing the mission from the CURRENT observed state. Compare the best available command in each category, regardless of how many commands it contains. Consider threats, force health, exploration, current mineral income and production. Current standing-guard units are idle; Continue starts no new activity. Existing economic work may continue while a military command is issued, and vice versa. Select the category now; independent companion questions recommend concrete commands within each category.",
+        "instructions": "Choose which kind of gameplay command would make the most useful progress toward completing the mission from the CURRENT observed state. Use the mission_playbook: establish income with idle SCVs, maintain affordable Marine production concurrently, concentrate combat power, and explore while sustaining replacements. Balance these needs against urgent observed threats. Compare the best available command in each category, regardless of how many commands it contains. Current standing-guard units are idle; Continue starts no new activity. Existing economic work may continue while a military command is issued, and vice versa. Select the category now; independent companion questions recommend concrete commands within each category.",
         "criteria": {},
     }}
     routing = graph_routing(actions)
@@ -556,7 +564,7 @@ def graph_request_for(state: dict, actions: dict[str, CombatAction], history: li
         if question_id is not None:
             questions[question_id] = {
                 "type": "choice",
-                "instructions": f"Assuming a {category.lower()} command is to be issued, choose the available concrete command that best advances the mission from the current observations. This is an independent recommendation, used only if the separate intent decision selects {category}. Compare actual actors, targets, health, current orders, resources, and previously observed positions. Avoid reversing a productive advance without a tactical reason; unknown enemy locations remain unknown. Choose one of these actual gameplay commands.",
+                "instructions": f"Assuming a {category.lower()} command is to be issued, choose the available concrete command that best advances the mission from the current observations and mission_playbook. Establish mineral income with idle workers, sustain affordable replacements, and coordinate combat forces rather than feeding isolated units. This is an independent recommendation, used only if the separate intent decision selects {category}. Compare actual actors, targets, health, current orders, resources, and previously observed positions. Avoid reversing a productive advance without a tactical reason; unknown enemy locations remain unknown. Choose one of these actual gameplay commands.",
                 "criteria": {key: flat_criteria[key] for key in candidate_ids},
             }
     return model_state, questions, routing

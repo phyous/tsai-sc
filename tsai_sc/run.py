@@ -145,6 +145,7 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
                         model_state, questions = request_for(state, actions, history)
                     write_json(recorder.directory / 'pending-request.json', {'state': model_state, 'questions': questions})
                     response = client.evaluate(model_state, questions)
+                    response['metadata']['observed_frame'] = state['frame']
                     choice, child_question = (combat.resolve_graph_choice(response, routing) if routing else
                                               (response['answers']['action']['choice'], 'action'))
                     if routing:

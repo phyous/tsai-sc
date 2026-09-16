@@ -328,9 +328,10 @@ def compose_frame(record: dict, game: Image.Image, *, speed: float = 4, test_onl
         _text(draw, (x, 154), value, 25, TEXT, True)
     draw.line((1048, 199, 1544, 199), fill=BORDER, width=1)
     _text(draw, (1048, 218), "ACTION PROBABILITIES", 15, GREEN, True)
-    observed_frame = state.get("frame")
+    observed_frame = metadata.get('observed_frame', state.get("frame"))
     frame_text = str(observed_frame) if type(observed_frame) is int and observed_frame >= 0 else "—"
-    decision_caption = f"Last Jev decision · observed frame {frame_text}" if groups else f"Observed frame {frame_text} · no Jev decision yet"
+    decision_caption = (f"Last Jev decision · evaluated frame {frame_text}" if 'observed_frame' in metadata else
+                        f"Last Jev probabilities · current game frame {frame_text}") if groups else f"Observed frame {frame_text} · no Jev decision yet"
     _text(draw, (1048, 242), decision_caption, 14, MUTED)
     rounded = [math.fsum(answer['probabilities'].values()) for _, answer in groups
                if not math.isclose(math.fsum(answer['probabilities'].values()), 1, abs_tol=1e-6, rel_tol=0)]
@@ -350,7 +351,7 @@ def compose_frame(record: dict, game: Image.Image, *, speed: float = 4, test_onl
         _text(draw, (1048, y), heading, 16)
         _text(draw, (1400, y + 1), f"conf {answer['confidence']:.2f}", 14, MUTED, True)
         max_options = max(2, min(5, (group_height - 40) // 31))
-        options = sorted(answer["probabilities"].items(), key=lambda item: (-item[1], item[0]))
+        options = sorted(answer["probabilities"].items(), key=lambda item: (-item[1], item[0] != answer['choice'], item[0]))
         for option_index, (option, probability) in enumerate(options[:max_options]):
             bar_y = y + 29 + option_index * 31
             selected = option == answer["choice"]

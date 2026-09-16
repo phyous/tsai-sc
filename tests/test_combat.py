@@ -308,6 +308,18 @@ class GraphTests(unittest.TestCase):
                     self.assertEqual(description, self.actions[key]["label"])
         self.assertIn("No joint probability", self.routing["semantics"])
 
+    def test_playbook_guidance_does_not_remove_competing_model_commands(self):
+        self.assertEqual(len(self.model["mission_playbook"]), 4)
+        self.assertIn("mission_playbook", self.questions["intent"]["instructions"])
+        self.assertEqual(set(self.questions["intent"]["criteria"]), {"Economy", "Engage", "Explore", "Reposition", "Continue"})
+        for branch in self.routing["branches"].values():
+            if branch["question"] is not None:
+                self.assertIn("mission_playbook", self.questions[branch["question"]]["instructions"])
+        # A model-selected alternative still routes exactly; guidance is no override.
+        response = self.response("Explore")
+        selected, _ = resolve_graph_choice(response, self.routing)
+        self.assertEqual(selected, response["answers"]["action_explore"]["choice"])
+
     def test_empty_categories_are_absent_and_singletons_have_no_child_question(self):
         observed = state()
         _, questions, routing = graph_request_for(observed, candidates(observed))

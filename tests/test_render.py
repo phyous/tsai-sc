@@ -258,10 +258,30 @@ class ValidationTests(unittest.TestCase):
         with patch("tsai_sc.render._text", wraps=module._text) as draw_text:
             compose_frame(record(), Image.new("RGB", (640, 480)), test_only=True)
         labels = [str(call.args[2]) for call in draw_text.call_args_list]
-        self.assertIn("Last Jev decision · observed frame 1200", labels)
+        self.assertIn("Last Jev probabilities · current game frame 1200", labels)
         self.assertIn("MODEL ORDER", labels)
         self.assertNotIn("EXECUTED ORDER", labels)
         self.assertTrue(any("PAUSED FOR DECISIONS" in label for label in labels))
+
+    def test_decision_frame_uses_the_evaluated_observation_not_later_game_state(self):
+        item = record()
+        item['decision']['metadata']['observed_frame'] = 1100
+        import tsai_sc.render as module
+        with patch('tsai_sc.render._text', wraps=module._text) as draw_text:
+            compose_frame(item, Image.new('RGB', (640, 480)), test_only=True)
+        labels = [str(call.args[2]) for call in draw_text.call_args_list]
+        self.assertIn('Last Jev decision · evaluated frame 1100', labels)
+
+    def test_tied_selected_option_remains_visible_when_bars_are_truncated(self):
+        item = record()
+        names = ['A', 'B', 'C', 'D', 'E', 'Z selected']
+        item['decision']['answers']['action'].update(
+            probabilities={name: 1/6 for name in names}, choice='Z selected')
+        import tsai_sc.render as module
+        with patch('tsai_sc.render._text', wraps=module._text) as draw_text:
+            compose_frame(item, Image.new('RGB', (640, 480)), test_only=True)
+        labels = [str(call.args[2]) for call in draw_text.call_args_list]
+        self.assertIn('Z selected', labels)
 
     def test_many_worker_options_preserve_probabilities(self):
         item = record()

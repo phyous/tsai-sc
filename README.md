@@ -110,6 +110,11 @@ All questions in a request are independent: a judgment that depends on another
 answer would instead require a later request, as described in the
 [TypeSafe API documentation](https://docs.typesafe.ai/primitives#when-one-question-depends-on-another).
 
+The prompt includes ordinary StarCraft guidance: establish mineral income,
+produce affordable reinforcements while other orders continue, keep a useful
+combat force together, and explore for remaining enemies. These instructions
+contain no enemy-base coordinates or predetermined mission route.
+
 | Model choice | Candidate supplied by the harness | Original game controls |
 | --- | --- | --- |
 | Focus fire | A currently visible hostile unit or building | Select squad, `A`, click target |
