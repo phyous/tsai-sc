@@ -276,7 +276,8 @@ def compose_frame(record: dict, game: Image.Image, *, speed: float = 4, test_onl
     draw = ImageDraw.Draw(canvas)
     draw.rectangle((0, 0, WIDTH, 5), fill=GREEN)
     _text(draw, (32, 26), "JEV × STARCRAFT", 34)
-    _text(draw, (34, 72), "BOOT CAMP  /  SHAREWARE MISSION  /  PAUSED FOR DECISIONS", 15, MUTED, True)
+    mission = safe_text(state.get('mission', 'StarCraft'), 32).upper()
+    _text(draw, (34, 72), f"{mission}  /  SHAREWARE MISSION  /  PAUSED FOR DECISIONS", 15, MUTED, True)
     status = record.get("status", "running")
     status_text = {"running": "MISSION IN PROGRESS", "victory": "VICTORY RECORDED", "defeat": "DEFEAT RECORDED"}[status]
     status_color = RED if status == "defeat" else GREEN
@@ -338,6 +339,11 @@ def compose_frame(record: dict, game: Image.Image, *, speed: float = 4, test_onl
             _text(draw, (1491, bar_y - 2), f"{probability:.0%}", 14, color, True)
         if len(options) > max_options:
             _text(draw, (1048, y + group_height - 18), f"Top {max_options} shown · {len(options) - max_options} more options in trace", 12, MUTED)
+    combat = state.get('combat')
+    if len(shown) == 1 and isinstance(combat, dict):
+        _text(draw, (1048, 523), "OBSERVED FORCE", 13, MUTED, True)
+        _text(draw, (1048, 548), f"{_resource(combat, 'own_marines')} Marines  ·  {_resource(combat, 'own_firebats')} Firebats  ·  {_resource(combat, 'own_ghosts')} Ghosts", 18)
+        _text(draw, (1048, 585), f"Visible hostile units: {_resource(combat, 'visible_enemy_units')}", 17, MUTED)
     if len(groups) > 3:
         _text(draw, (1048, 671), f"{len(groups) - 3} additional question(s) preserved in trace", 12, MUTED)
 

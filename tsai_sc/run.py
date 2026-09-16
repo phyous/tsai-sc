@@ -1,4 +1,4 @@
-"""Play and record Boot Camp using genuine Jev decisions and original game input."""
+"""Play and record an original mission using genuine Jev decisions and game input."""
 from __future__ import annotations
 
 import argparse
@@ -9,6 +9,7 @@ from pathlib import Path
 import time
 
 from .controller import InputAdapter, candidates, request_for, verify_command
+from . import combat
 from .engine import BottleShipBridge
 from .game import GameStateError, read_state
 from .typesafe import TypeSafeClient, TypeSafeError
@@ -30,7 +31,7 @@ class Recorder:
         self.index = 0
         self.state = {}
         self.decision = None
-        self.action = {'label': 'Observing original Boot Camp mission'}
+        self.action = {'label': 'Observing original StarCraft mission'}
 
     def frame(self, force=False, status='running'):
         now = time.monotonic() - self.start
@@ -38,7 +39,7 @@ class Recorder:
             return
         filename = f'frames/{self.index:06d}.png'
         self.bridge.capture(self.directory / filename)
-        public_state = {k: self.state[k] for k in ('mission', 'frame', 'minerals', 'gas', 'supply', 'objective_progress') if k in self.state}
+        public_state = {k: self.state[k] for k in ('mission', 'mission_kind', 'objective_summary', 'combat', 'frame', 'minerals', 'gas', 'supply', 'objective_progress') if k in self.state}
         row = {'t': now, 'frame': filename, 'state': public_state, 'decision': self.decision,
                'action': self.action, 'status': status}
         self.trace.write(json.dumps(row, separators=(',', ':')) + '\n')
@@ -54,7 +55,7 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
     bridge.pause()
     initial = read_state(bridge.read_memory)
     if initial['status'] != 'running':
-        raise RuntimeError('Start a fresh running Boot Camp mission before recording')
+        raise RuntimeError('Start a fresh running original mission before recording')
     client = TypeSafeClient(env_file=env_file, max_requests=max_requests)
     recorder = Recorder(bridge, directory, capture_fps)
     recorder.state = initial
@@ -63,8 +64,9 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
     start = time.monotonic()
     model_calls = 0
     final = None
+    last_observed_frame = None
     write_json(recorder.directory / 'manifest.json', {
-        'started_utc': datetime.now(timezone.utc).isoformat(), 'mission': 'Boot Camp',
+        'started_utc': datetime.now(timezone.utc).isoformat(), 'mission': initial['mission'],
         'game': 'Original StarCraft Shareware(ED) v4.00 executable on BottleShip',
         'model_requested': 'jev-latest', 'initial_state': initial,
         'pacing': 'Game paused for consistent memory snapshots and model inference; ordinary game input between snapshots.',
@@ -72,6 +74,8 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
         'controller': 'Jev selects one candidate; deterministic worker/target/placement/input adapter',
         'max_requests': max_requests, 'max_seconds': max_seconds, 'capture_fps': capture_fps,
         'decision_seconds': decision_seconds,
+        'source_sha256': {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                          for path in sorted(Path(__file__).parent.glob('*.py'))},
     })
     try:
         recorder.frame(force=True)
@@ -82,12 +86,38 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
                 recorder.state = state
                 if state['status'] != 'running':
                     final = state
+                    recorder.action = {'label': 'Original game engine reports ' + state['status'] + '; waiting for its result screen'}
+                    # The original executable sets its outcome before it paints
+                    # the Victory dialog. Record that authentic transition too.
+                    bridge.resume()
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
+                        recorder.frame()
+                        time.sleep(.04)
+                    bridge.pause()
+                    bridge.capture(recorder.directory / 'victory-screen.png')
                     recorder.action = {'label': 'Original game engine reports ' + state['status']}
                     recorder.frame(force=True, status=state['status'])
                     break
-                actions = candidates(state)
+                stopped_clock = state['frame'] == last_observed_frame
+                last_observed_frame = state['frame']
+                if state.get('game_paused') or stopped_clock:
+                    # Original campaign transmissions can pause simulation and
+                    # force the camera. Wait for gameplay to resume, recording
+                    # the original presentation without issuing tactical input.
+                    recorder.action = {'label': 'Original game pause — waiting for mission transmission to finish'}
+                    bridge.resume()
+                    deadline = time.monotonic() + decision_seconds
+                    while time.monotonic() < deadline:
+                        recorder.frame()
+                        time.sleep(.04)
+                    bridge.pause()
+                    continue
+                is_combat = state.get('mission_kind') == 'combat'
+                actions = combat.candidates(state, combat.STRONGARM, history) if is_combat else candidates(state)
                 if len(actions) > 1:
-                    model_state, questions = request_for(state, actions, history)
+                    model_state, questions = (combat.request_for(state, actions, history, combat.STRONGARM)
+                                              if is_combat else request_for(state, actions, history))
                     response = client.evaluate(model_state, questions)
                     choice = response['answers']['action']['choice']
                     selected = actions[choice]
@@ -96,23 +126,30 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
                     recorder.frame(force=True)
                     issued = adapter.execute(state, selected)
                     after = read_state(bridge.read_memory)
-                    verified = verify_command(state, after, selected)
+                    executed = ({**selected, 'units': issued['selected_units']} if 'selected_units' in issued else selected)
+                    verified = (verify_command(state, after, executed) if issued.get('issued') else
+                                {'accepted': False, 'evidence': issued.get('reason', 'Input was not issued')})
                     if issued.get('issued') and selected['kind'] == 'build' and not verified['accepted']:
                         # Clear only a failed placement cursor, never an active
                         # training queue or construction order before selection.
                         bridge.resume()
+                        issued['inputs'].append({'command': 'keyHold', 'args': ['escape', 60]})
                         bridge.rpc('keyHold', 'escape', 60)
                         time.sleep(.15)
                         bridge.pause()
                     recorder.state = after
                     recorder.action = {**selected, **verified}
                     event = {'t': time.monotonic() - start, 'state': state, 'request': {'state': model_state, 'questions': questions},
-                             'response': response, 'selected': choice, 'action': selected, 'input_result': issued, 'command_verification': verified,
+                             'response': response, 'selected': choice, 'candidates': actions, 'action': selected,
+                             'input_result': issued, 'command_verification': verified,
                              'after': {'frame': after['frame'], 'minerals': after['minerals'], 'gas': after['gas'],
                                        'workers': [u for u in after['units'] if u['type_id'] == 7 and u['owner'] == after['player_id']]}}
                     decisions.write(json.dumps(event, separators=(',', ':')) + '\n')
                     decisions.flush()
-                    history.append({'command': selected['label'], 'frame': state['frame'], 'accepted': verified['accepted'], 'minerals_after': after['minerals'], 'gas_after': after['gas']})
+                    history.append({'command': selected['label'], 'kind': selected['kind'], 'squad': selected.get('squad'), 'point': selected.get('point'),
+                                    'units': executed.get('units', [executed['unit']] if 'unit' in executed else []),
+                                    'squad_centers': [{'name': squad['name'], **squad['center']} for squad in model_state.get('squads', [])],
+                                    'frame': state['frame'], 'accepted': verified['accepted'], 'minerals_after': after['minerals'], 'gas_after': after['gas']})
                     print(f'call={model_calls} frame={state["frame"]} minerals={state["minerals"]} gas={state["gas"]} choice={choice} probability={response["answers"]["action"]["probabilities"][choice]:.3f}', flush=True)
                 else:
                     recorder.action = {'label': 'Current orders continue; no new command available'}
@@ -128,8 +165,13 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
             'status': final['status'], 'engine_evidence': final['evidence'],
             'final_state': final, 'elapsed_seconds': time.monotonic() - start,
             'model_calls': model_calls, 'captured_frames': recorder.index,
+            'api_attempts': client.request_count,
+            'accounted_input_tokens': client.input_tokens_total,
             'trace_sha256': hashlib.sha256((recorder.directory / 'trace.jsonl').read_bytes()).hexdigest(),
             'decisions_sha256': hashlib.sha256((recorder.directory / 'decisions.jsonl').read_bytes()).hexdigest(),
+            'visible_victory_frame': 'victory-screen.png',
+            'visible_victory_frame_sha256': hashlib.sha256((recorder.directory / 'victory-screen.png').read_bytes()).hexdigest(),
+            'visual_verification': 'Captured original game result screen; inspect the PNG before publishing a victory claim.',
         })
         print(f'Original engine outcome: {final["status"]}; {model_calls} Jev decisions.', flush=True)
         return final['status']

@@ -15,7 +15,7 @@ with an incomplete Xcode selection, set
 scripts/setup-runtime.sh
 scripts/start-runtime.sh
 # In another terminal, from the repository root:
-python -m tsai_sc.boot
+python -m tsai_sc.boot --mission strongarm
 ```
 
 Setup downloads BottleShip at commit
@@ -26,16 +26,32 @@ the ignored `.runtime/` directory. The demo remains Blizzard's copyrighted
 software and is not included in this repository. Read its bundled `License.txt`.
 
 Startup creates a dedicated headless Chrome profile. It does not use browser
-accounts or login sessions. The first boot navigates to Boot Camp using ordinary
-input, dismisses the tips dialog, verifies the initial resources/units and parks
-the emulator. A fresh profile is expected for that initial boot sequence. To restart an active
-Boot Camp after stopping its controller, use `python -m tsai_sc.boot --restart`
-or call `from tsai_sc.boot import restart; restart(bridge)`. This opens the game's
-F10 / End Mission / Restart Mission / confirmation menus using ordinary input,
-waits for the level to reload, then parks and verifies 150 minerals, zero gas,
-17/18 supply, one SCV, one Command Center and one depot. The startup script
-requires port 5174 and starts Vite with `--strictPort`; it never silently moves
-the emulator to another development port.
+accounts or login sessions. `--mission strongarm` enters the first combat mission
+through the original **Skip Tutorial** button, then verifies the starting state
+and parks the game. The objective shown by the game is **Destroy the rebel base**.
+Use `--mission boot_camp` for the optional economy tutorial. A fresh profile is
+expected for either initial boot sequence.
+
+After stopping the controller, restart the current mission with
+`python -m tsai_sc.boot --restart`, or call
+`from tsai_sc.boot import restart; restart(bridge)`. The helper identifies the
+active mission, uses its F10 / End Mission / Restart Mission / confirmation menus,
+and verifies the untouched starting state after reload:
+
+| Mission | Minerals / gas | Supply | SCVs / Marines | Starting buildings |
+| --- | --- | --- | --- | --- |
+| Strongarm | 250 / 200 | 12 / 42 | 4 / 8 | 1 Command Center, 4 Depots, 1 Refinery, 2 Barracks, 1 Engineering Bay |
+| Boot Camp | 150 / 0 | 17 / 18 | 1 / 16 | 1 Command Center, 1 Depot |
+
+Restarting does not change scenarios. To select another scenario, start a fresh
+runtime profile. The startup script requires port 5174 and uses Vite
+`--strictPort`; it never silently moves the emulator to another port.
+
+The normal campaign progression has also been verified: the tutorial's original
+**Victory** dialog leads to a **Victory!** score screen. Its **OK** button continues
+to the **Strongarm** chapter title and mission. Within the mission, F10 → Mission
+Objectives displays the original objective. These screens are ordinary game UI;
+the harness never changes campaign progress through memory writes.
 
 ## Python API
 
@@ -70,11 +86,22 @@ DDraw presenter may return black frames through the worker capture method.
 
 ```sh
 python -m unittest discover -s tests -p test_engine.py -v
+python -m unittest discover -s tests -p test_boot.py -v
 TSAI_TEST_BRIDGE_URL=http://127.0.0.1:3917 python -m unittest discover -s tests -p test_bridge_protocol.py -v
 ```
 
 The client enforces loopback-only HTTP, disables proxies and redirects, checks
 response sizes and read lengths, and excludes backend error bodies from logs.
 The optional live checks send only invalid requests; they do not change the game.
-A full fresh-profile boot has also been verified against the pinned executable,
-including a 640×480 screenshot and the original mission's initial unit/resources.
+Runtime verification covers a fresh Boot Camp profile, its original victory
+dialog and score screen, and normal progression into Strongarm with the initial
+roster above. The direct Skip Tutorial startup has also passed end-to-end in a separate fresh
+headless browser profile. It checks whether the chapter title's Enter already
+started gameplay before clicking the Strongarm briefing's Start button, then
+verifies the original in-game identity/resources/roster. Restarting Strongarm has
+also passed these live checks. If a screen transition or emulator error prevents
+loading the expected state, startup stops instead of accepting another mission. The game is paused before these multi-read state checks.
+
+If BottleShip reports a guest crash during startup, stop the dedicated runtime,
+start it again with a fresh profile, and repeat the boot command. Startup does
+not repair a crashed guest or alter mission state to pass its checks.

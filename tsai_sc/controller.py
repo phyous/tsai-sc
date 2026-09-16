@@ -8,13 +8,18 @@ from __future__ import annotations
 import math
 import struct
 import time
-from .game import CAMERA, game_to_screen, read_state
+from .game import CAMERA, game_to_screen, read_state, read_selection
 
 BUILDING_SIZE = {106: (128, 96), 109: (96, 64), 110: (128, 64)}
 IDLE = {1, 2, 3}
 BUILDING_ORDERS = {30, 33, 34, 35}
 GAS_ORDERS = {81, 82, 83, 84}
 MINERAL_ORDERS = {79, 80, 85, 86, 87, 88, 89, 90}
+SQUAD_ORDERS = {'attack_move', 'attack_target', 'retreat', 'regroup', 'explore'}
+
+
+class CommandUnavailable(RuntimeError):
+    """A moving target or scripted camera change prevented this command."""
 
 
 def own_units(state, type_id):
@@ -38,14 +43,32 @@ def supply(state):
 def verify_command(before, after, action):
     """Separate dispatch from observed engine acceptance without retrying policy."""
     kind = action['kind']
-    if kind == 'wait':
+    if kind in {'wait', 'continue'}:
         return {'accepted': True, 'evidence': 'No new command requested'}
     units = {u['id']: u for u in after['units']}
+    if kind in SQUAD_ORDERS:
+        actors = [units[i] for i in action['units'] if i in units]
+        # A previous attack does not prove a new retreat was accepted. Match the
+        # order family and destination, allowing attack-move to acquire enemies.
+        point = action['point']
+        def matches(u):
+            destination = u.get('order_target', {})
+            near = isinstance(destination, dict) and 'x' in destination and math.dist((destination['x'], destination['y']), (point['x'], point['y'])) <= 48
+            if kind in {'retreat', 'regroup'}:
+                return u['order_id'] == 6 and near
+            if kind == 'attack_target':
+                target = next((t for t in before['units'] if t['id'] == action['target']), None)
+                return u['order_id'] == 10 and target is not None and u.get('order_target_address') == target.get('address')
+            return (u['order_id'] == 14 and near) or u['order_id'] == 10
+        active = [u for u in actors if matches(u)]
+        return {'accepted': bool(active), 'evidence': 'Observed surviving squad orders',
+                'actor_orders': {str(u['id']): u['order_id'] for u in actors}}
     unit = units.get(action['unit'])
     if unit is None:
         return {'accepted': False, 'evidence': 'Actor no longer observable'}
     if kind == 'train':
-        accepted = 7 in unit['build_queue'] or len(own_units(after, 7)) > len(own_units(before, 7))
+        trained = action.get('train_type', 7)
+        accepted = trained in unit['build_queue'] or len(own_units(after, trained)) > len(own_units(before, trained))
     elif kind == 'build':
         started = any(math.dist((u['x'], u['y']), (action['point']['x'], action['point']['y'])) < 24 for u in own_units(after, action['building']))
         accepted = started or unit['order_id'] in {30, 33}
@@ -169,6 +192,7 @@ class InputAdapter:
         self.bridge = bridge
         self.on_frame = on_frame
         self.inputs = []
+        self.map_size = (64, 64)
 
     def _settle(self, seconds=.2):
         until = time.monotonic() + seconds
@@ -193,17 +217,115 @@ class InputAdapter:
         point = game_to_screen(x, y, self.camera(), height=312)
         if point and margin_x <= point['x'] <= 639 - margin_x and margin_y <= point['y'] <= 311 - margin_y:
             return point
-        # Boot Camp is64x64 tiles. The stock640x480 minimap starts at(6,348).
-        self._input('clickHold', round(6 + x / 16), round(348 + y / 16), 100, 0)
-        point = game_to_screen(x, y, self.camera(), height=312)
-        if point is None:
-            raise RuntimeError('Could not place selected target inside the game viewport')
-        return point
+        # Original minimap zoom is a power of two:64x64 uses2px/tile,
+        # Strongarm's96x64 uses1px/tile, centered in the128px panel.
+        w, h = self.map_size
+        pixels_per_tile = 2 ** math.floor(math.log2(128 / max(w, h)))
+        scale = 32 / pixels_per_tile
+        for _ in range(2):
+            self._input('clickHold', round(6 + (128 - w * 32 / scale) / 2 + x / scale),
+                        round(348 + (128 - h * 32 / scale) / 2 + y / scale), 100, 0)
+            point = game_to_screen(x, y, self.camera(), height=312)
+            if point is not None:
+                return point
+        raise CommandUnavailable('Camera did not expose the selected target; re-observe before issuing another command')
+
+    def _select_squad(self, state, action):
+        """Reuse an exact current selection, otherwise select with Shift-clicks."""
+        self.bridge.pause()
+        actual = read_selection(self.bridge.read_memory)
+        requested = set(action['units'])
+        if actual and set(actual) == requested:
+            fresh = read_state(self.bridge.read_memory)
+            available = {u['id'] for u in fresh['units'] if u['owner'] == state['player_id']
+                         and u['completed'] and u['visible']}
+            if requested.issubset(available):
+                return {'selected_units': actual, 'selection_method': 'already_selected'}
+        selected = []
+        for unit_id in action['units'][:12]:
+            self.bridge.pause()
+            fresh = read_state(self.bridge.read_memory)
+            actor = next((u for u in fresh['units'] if u['id'] == unit_id), None)
+            if not actor or actor['owner'] != state['player_id'] or not actor['completed'] or not actor['visible']:
+                continue
+            self.bridge.resume()
+            self.focus(actor['x'], actor['y'])
+            self.bridge.pause()
+            fresh = read_state(self.bridge.read_memory)
+            actor = next((u for u in fresh['units'] if u['id'] == unit_id), None)
+            available = actor and actor['owner'] == state['player_id'] and actor['completed'] and actor['visible']
+            point = game_to_screen(actor['x'], actor['y'], fresh['camera'], height=312) if available else None
+            if point is None:
+                continue
+            self.bridge.resume()
+            if selected:
+                self._input('key', 'shift', {'down': True})
+            try:
+                self._input('clickHold', point['x'], point['y'], 100, 0)
+            finally:
+                if selected:
+                    self._input('key', 'shift', {'up': True})
+            selected.append(unit_id)
+        if not selected:
+            return {'issued': False, 'inputs': list(self.inputs), 'reason': 'Squad became unavailable'}
+        self.bridge.pause()
+        actual = read_selection(self.bridge.read_memory)
+        if not actual or not set(actual).issubset(set(action['units'])):
+            return {'issued': False, 'inputs': list(self.inputs), 'reason': 'Observed selection differs from requested squad',
+                    'selected_units': actual}
+        return {'selected_units': actual, 'selection_method': 'shift_click'}
+
+    def _squad(self, state, action):
+        """Apply the model's command to a verified selection."""
+        selection = self._select_squad(state, action)
+        if selection.get('issued') is False:
+            return selection
+        actual = selection['selected_units']
+        self.bridge.resume()
+        target = action['point']
+        if action['kind'] == 'attack_target':
+            self.bridge.pause()
+            fresh = read_state(self.bridge.read_memory)
+            enemy = next((u for u in fresh['units'] if u['id'] == action['target'] and u['visible']
+                          and u['owner'] in fresh.get('enemy_players', [])), None)
+            self.bridge.resume()
+            if enemy:
+                target = {'x': enemy['x'], 'y': enemy['y']}
+            else:
+                return {'issued': False, 'inputs': list(self.inputs), 'reason': 'Focus target is no longer visible', 'selected_units': actual}
+        point = self.focus(**target)
+        self._input('keyHold', 'a' if action['kind'] in {'attack_move', 'attack_target', 'explore'} else 'm', 60)
+        self._input('clickHold', point['x'], point['y'], 100, 0)
+        self._input('move', 320, 280)
+        return {'issued': True, 'inputs': list(self.inputs), **selection}
 
     def execute(self, state, action):
+        try:
+            return self._execute(state, action)
+        except CommandUnavailable as error:
+            self.bridge.pause()
+            return {'issued': False, 'inputs': list(self.inputs), 'reason': str(error)}
+
+    def _execute(self, state, action):
         self.inputs = []
-        if action['kind'] == 'wait':
+        self.map_size = (state['map']['width_tiles'], state['map']['height_tiles'])
+        if action['kind'] in {'wait', 'continue'}:
             return {'issued': True, 'inputs': []}
+        if action['kind'] in SQUAD_ORDERS:
+            try:
+                result = self._squad(state, action)
+            finally:
+                try:
+                    event = {'command': 'key', 'args': ['shift', {'up': True}]}
+                    self.inputs.append(event)
+                    released = self.bridge.rpc(event['command'], *event['args'])
+                    if isinstance(released, dict) and released.get('ok') is False:
+                        raise RuntimeError('Original game modifier cleanup was rejected by the runtime')
+                finally:
+                    self.bridge.pause()
+            # Include finally's ordinary key release in every returned trace.
+            result['inputs'] = list(self.inputs)
+            return result
         units = {u['id']: u for u in state['units']}
         unit = units[action['unit']]
         self.bridge.resume()
@@ -228,7 +350,7 @@ class InputAdapter:
             self.bridge.resume()
             self._settle()
             if action['kind'] == 'train':
-                self._input('keyHold', 's', 60)
+                self._input('keyHold', {7: 's', 0: 'm', 32: 'f'}[action.get('train_type', 7)], 60)
             elif action['kind'] == 'gather':
                 target = units[action['target']]
                 point = self.focus(target['x'], target['y'])
@@ -242,7 +364,7 @@ class InputAdapter:
                 # tile, whereas CUnit coordinates denote the footprint center.
                 px, py = point['x'] - w // 2, point['y'] - h // 2
                 if px < 0 or py < 20:
-                    raise RuntimeError('Building footprint is outside the safe placement viewport')
+                    raise CommandUnavailable('Building footprint is outside the safe placement viewport')
                 self._input('move', px, py)
                 self._input('clickHold', px, py, 100, 0)
             else:

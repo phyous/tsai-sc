@@ -5,12 +5,13 @@ import unittest
 from unittest.mock import patch
 
 from tsai_sc.controller import InputAdapter, candidates, depot_sites, request_for, supply, verify_command
-from tsai_sc.game import CAMERA, UNIT_NAMES
+from tsai_sc.game import CAMERA, UNIT_BASE, UNIT_SIZE, UNIT_NAMES
 
 
 def unit(index, kind, x, y, *, owner=6, completed=True, visible=True, order=3, queue=()):
     return {
         'id': index, 'type_id': kind, 'owner': owner, 'x': x, 'y': y,
+        'address': UNIT_BASE + index * UNIT_SIZE,
         'completed': completed, 'visible': visible, 'order_id': order,
         'build_queue': list(queue), 'type': UNIT_NAMES.get(kind, f'Unit {kind}'),
         'hp': 60, 'remaining_build_time': 0,
@@ -280,6 +281,18 @@ class ControllerTests(unittest.TestCase):
         self.assertNotIn(('keyHold', 'b', 60), bridge.calls)
         self.assertFalse(bridge.running)
 
+    def test_scripted_camera_override_rejects_command_without_ending_run(self):
+        bridge = Bridge(camera=(0, 0))
+        state = mission()
+        state['units'][0].update(x=900, y=800)
+        action = candidates(state)['mine_1']
+        result = self.adapter(bridge).execute(state, action)
+        self.assertFalse(result['issued'])
+        self.assertIn('Camera', result['reason'])
+        self.assertEqual(sum(call[0] == 'clickHold' for call in bridge.calls), 2)
+        self.assertFalse(any(call[0] == 'keyHold' for call in bridge.calls))
+        self.assertFalse(bridge.running)
+
     def test_wait_does_not_issue_unselected_commands(self):
         bridge = Bridge()
         result = self.adapter(bridge).execute(mission(), {'kind': 'wait'})
@@ -427,6 +440,209 @@ class ModelObservationTests(unittest.TestCase):
         self.assertEqual(remaining['workers_collecting_minerals'], 1)
         self.assertEqual(remaining['workers_collecting_gas'], 1)
         self.assertEqual(remaining['workers_constructing'], 1)
+
+
+class TacticalControllerTests(unittest.TestCase):
+    def state(self):
+        state = mission()
+        state.update(mission='Strongarm', mission_id='strongarm', enemy_players=[0, 3])
+        state['map'] = {'width_tiles': 96, 'height_tiles': 64}
+        state['units'] = [
+            unit(1, 0, 300, 500), unit(2, 0, 360, 520),
+            unit(3, 7, 320, 540), unit(4, 111, 500, 500),
+            unit(9, 37, 480, 560, owner=3),
+        ]
+        return state
+
+    def action(self, kind='attack_move'):
+        return {'kind': kind, 'units': [1, 2], 'point': {'x': 500, 'y': 560}}
+
+    def execute(self, state, action, *, actual=(1, 2), bridge=None, snapshots=None):
+        bridge = bridge or Bridge()
+        adapter = InputAdapter(bridge)
+        adapter._settle = lambda *args: None
+        reader = {'side_effect': snapshots} if snapshots is not None else {'return_value': state}
+        with patch('tsai_sc.controller.read_state', **reader), patch('tsai_sc.controller.read_selection', side_effect=[[], list(actual)]):
+            result = adapter.execute(state, action)
+        return result, bridge
+
+    def test_squad_uses_shift_selection_then_attack_and_releases_modifier(self):
+        result, bridge = self.execute(self.state(), self.action())
+        self.assertTrue(result['issued'])
+        self.assertEqual(result['selected_units'], [1, 2])
+        self.assertIn(('key', 'shift', {'down': True}), bridge.calls)
+        up = ('key', 'shift', {'up': True})
+        self.assertIn(up, bridge.calls)
+        self.assertLess(bridge.calls.index(up), bridge.calls.index(('keyHold', 'a', 60)))
+        self.assertIn(('clickHold', 500, 176, 100, 0), bridge.calls)
+        self.assertEqual(bridge.calls[-2:], [up, ('pause',)])
+        self.assertFalse(bridge.running)
+        self.assertFalse(any(call[0] == 'keyHold' and call[1] == 'escape' for call in bridge.calls))
+        self.assertEqual(result['inputs'][-1], {'command': 'key', 'args': ['shift', {'up': True}]})
+        self.assertEqual(result['selection_method'], 'shift_click')
+
+    def test_exact_existing_selection_skips_clicks_and_modifier_presses(self):
+        state = self.state()
+        bridge = Bridge()
+        adapter = InputAdapter(bridge)
+        adapter._settle = lambda *args: None
+        with patch('tsai_sc.controller.read_state', return_value=state) as fresh, \
+                patch('tsai_sc.controller.read_selection', return_value=[2, 1]):
+            result = adapter.execute(state, self.action())
+        self.assertTrue(result['issued'])
+        self.assertEqual(result['selected_units'], [2, 1])
+        self.assertEqual(result['selection_method'], 'already_selected')
+        self.assertEqual(fresh.call_count, 1)
+        # Only the requested order's destination is clicked, not each Marine.
+        self.assertEqual([call for call in bridge.calls if call[0] == 'clickHold'], [('clickHold', 500, 176, 100, 0)])
+        self.assertNotIn(('key', 'shift', {'down': True}), bridge.calls)
+        self.assertEqual(result['inputs'][-1], {'command': 'key', 'args': ['shift', {'up': True}]})
+
+    def test_partial_existing_selection_does_not_skip_missing_squad_members(self):
+        state = self.state()
+        bridge = Bridge()
+        adapter = InputAdapter(bridge)
+        adapter._settle = lambda *args: None
+        with patch('tsai_sc.controller.read_state', return_value=state), \
+                patch('tsai_sc.controller.read_selection', side_effect=[[1], [1, 2]]):
+            result = adapter.execute(state, self.action())
+        self.assertEqual(result['selection_method'], 'shift_click')
+        self.assertIn(('clickHold', 360, 136, 100, 0), bridge.calls)
+
+    def test_exact_selection_still_requires_current_owned_visible_complete_units(self):
+        state = self.state()
+        fresh = copy.deepcopy(state)
+        fresh['units'][0]['visible'] = False
+        bridge = Bridge()
+        adapter = InputAdapter(bridge)
+        adapter._settle = lambda *args: None
+        action = self.action()
+        action['units'] = [1]
+        with patch('tsai_sc.controller.read_state', return_value=fresh), \
+                patch('tsai_sc.controller.read_selection', return_value=[1]):
+            result = adapter.execute(state, action)
+        self.assertFalse(result['issued'])
+        self.assertFalse(any(call[0] == 'keyHold' for call in bridge.calls))
+        self.assertFalse(bridge.running)
+
+    def test_selection_cannot_command_units_outside_model_requested_squad(self):
+        for actual in ([], [3], [1, 3], [1, 99]):
+            with self.subTest(actual=actual):
+                result, bridge = self.execute(self.state(), self.action(), actual=actual)
+                self.assertFalse(result['issued'])
+                self.assertFalse(any(call[0] == 'keyHold' for call in bridge.calls))
+                self.assertEqual(bridge.calls[-2:], [('key', 'shift', {'up': True}), ('pause',)])
+
+    def test_reported_squad_is_actual_selection_not_attempted_clicks(self):
+        result, _ = self.execute(self.state(), self.action(), actual=[1])
+        self.assertTrue(result['issued'])
+        self.assertEqual(result['selected_units'], [1])
+
+    def test_unavailable_unit_after_camera_refresh_is_not_clicked(self):
+        for change in ({'visible': False}, {'completed': False}, {'owner': 0}):
+            with self.subTest(change=change):
+                state = self.state()
+                fresh = copy.deepcopy(state)
+                fresh['units'][0].update(change)
+                action = self.action()
+                action['units'] = [1]
+                result, bridge = self.execute(state, action, snapshots=[state, fresh], actual=[])
+                self.assertFalse(result['issued'])
+                self.assertFalse(any(call[0] in {'clickHold', 'keyHold'} for call in bridge.calls))
+
+    def test_shift_is_released_when_second_selection_click_raises(self):
+        class FailedSecondClick(Bridge):
+            def rpc(self, command, *args):
+                result = super().rpc(command, *args)
+                if command == 'clickHold' and sum(call[0] == 'clickHold' for call in self.calls) == 2:
+                    raise RuntimeError('selection click failed')
+                return result
+        bridge = FailedSecondClick()
+        with self.assertRaisesRegex(RuntimeError, 'selection click failed'):
+            self.execute(self.state(), self.action(), bridge=bridge)
+        down_index = bridge.calls.index(('key', 'shift', {'down': True}))
+        self.assertIn(('key', 'shift', {'up': True}), bridge.calls[down_index + 1:])
+        self.assertEqual(bridge.calls[-1], ('pause',))
+        self.assertFalse(bridge.running)
+
+    def test_disappeared_or_newly_allied_focus_target_does_not_become_ground_attack(self):
+        for change in ({'visible': False}, {'owner': 2}):
+            with self.subTest(change=change):
+                state = self.state()
+                fresh = copy.deepcopy(state)
+                fresh['units'][-1].update(change)
+                action = self.action('attack_target')
+                action['target'] = 9
+                result, bridge = self.execute(state, action, snapshots=[state] * 4 + [fresh])
+                self.assertFalse(result['issued'])
+                self.assertFalse(any(call[0] == 'keyHold' for call in bridge.calls))
+
+    def test_focus_uses_current_visible_enemy_position(self):
+        state = self.state()
+        fresh = copy.deepcopy(state)
+        fresh['units'][-1].update(x=540, y=590)
+        action = self.action('attack_target')
+        action['target'] = 9
+        result, bridge = self.execute(state, action, snapshots=[state] * 4 + [fresh])
+        self.assertTrue(result['issued'])
+        self.assertIn(('clickHold', 540, 206, 100, 0), bridge.calls)
+
+    def test_strongarm_minimap_uses_centered_one_pixel_per_tile_geometry(self):
+        bridge = Bridge(camera=(0, 0))
+        bridge.pan_to = (1280, 864)
+        adapter = InputAdapter(bridge)
+        adapter.map_size = (96, 64)
+        adapter._settle = lambda *args: None
+        self.assertEqual(adapter.focus(1600, 1024), {'x': 320, 'y': 160})
+        # Actual 96x64 minimap rectangle x22..118,y380..444, world/32.
+        self.assertEqual(bridge.calls, [('clickHold', 72, 412, 100, 0)])
+
+    def test_marine_training_uses_barracks_hotkey_and_verifies_marine_queue(self):
+        state = self.state()
+        action = {'kind': 'train', 'unit': 4, 'train_type': 0}
+        result, bridge = self.execute(state, action)
+        self.assertTrue(result['issued'])
+        self.assertEqual([call[1] for call in bridge.calls if call[0] == 'keyHold'], ['m'])
+        after = copy.deepcopy(state)
+        after['units'][3]['build_queue'] = [7]
+        self.assertFalse(verify_command(state, after, action)['accepted'])
+        after['units'][3]['build_queue'] = [0]
+        self.assertTrue(verify_command(state, after, action)['accepted'])
+
+    def test_retreat_requires_move_order_to_requested_destination(self):
+        state = self.state()
+        after = copy.deepcopy(state)
+        actor = after['units'][0]
+        action = self.action('retreat')
+        actor.update(order_id=10, order_target=action['point'])
+        self.assertFalse(verify_command(state, after, action)['accepted'])
+        actor.update(order_id=6, order_target={'x': 100, 'y': 100})
+        self.assertFalse(verify_command(state, after, action)['accepted'])
+        actor['order_target'] = action['point']
+        self.assertTrue(verify_command(state, after, action)['accepted'])
+
+    def test_focus_verification_matches_target_pointer(self):
+        state = self.state()
+        after = copy.deepcopy(state)
+        action = self.action('attack_target')
+        action['target'] = 9
+        actor = after['units'][0]
+        actor.update(order_id=10, order_target_address=state['units'][2]['address'])
+        self.assertFalse(verify_command(state, after, action)['accepted'])
+        actor['order_target_address'] = state['units'][-1]['address']
+        self.assertTrue(verify_command(state, after, action)['accepted'])
+
+    def test_attack_move_verification_accepts_destination_or_enemy_acquisition(self):
+        state = self.state()
+        after = copy.deepcopy(state)
+        action = self.action()
+        actor = after['units'][0]
+        actor.update(order_id=14, order_target={'x': 100, 'y': 100})
+        self.assertFalse(verify_command(state, after, action)['accepted'])
+        actor['order_target'] = action['point']
+        self.assertTrue(verify_command(state, after, action)['accepted'])
+        actor.update(order_id=10, order_target={'x': 450, 'y': 560})
+        self.assertTrue(verify_command(state, after, action)['accepted'])
 
 
 if __name__ == '__main__':

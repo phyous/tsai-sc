@@ -247,6 +247,8 @@ class TypeSafeClient:
         self.request_count = 0
         self.input_tokens_total = 0
         self.output_tokens_total = 0
+        self.rejected_response_attempts_total = 0
+        self.rejected_usage_unavailable_attempts_total = 0
         self._api_key = read_api_key(env_file)
         self._open = opener if opener is not None else build_opener(_NoRedirect()).open
         self._sleep = sleep
@@ -273,6 +275,7 @@ class TypeSafeClient:
 
     def _evaluate(self, payload: bytes, questions: dict[str, dict]) -> dict:
         started = time.perf_counter()
+        rejected = rejected_input = rejected_output = rejected_unknown_usage = 0
         for attempt in range(self.max_retries + 1):
             if self.request_count >= self.max_requests:
                 raise RequestLimitError("TypeSafe request limit reached; no additional request was sent.")
@@ -300,13 +303,35 @@ class TypeSafeClient:
                     raise TransportError("TypeSafe request failed after bounded retries.") from None
             else:
                 if status == 200:
-                    if len(body) > MAX_RESPONSE_BYTES:
-                        raise ResponseValidationError("TypeSafe response exceeded the size limit.")
+                    raw = None
                     try:
-                        raw = json.loads(body, object_pairs_hook=_json_object)
-                    except (ValueError, UnicodeError, RecursionError):
-                        raise ResponseValidationError("TypeSafe returned invalid JSON; no action was selected.") from None
-                    result = validate_response(raw, questions)
+                        if len(body) > MAX_RESPONSE_BYTES:
+                            raise ResponseValidationError("TypeSafe response exceeded the size limit.")
+                        try:
+                            raw = json.loads(body, object_pairs_hook=_json_object)
+                        except (ValueError, UnicodeError, RecursionError):
+                            raise ResponseValidationError("TypeSafe returned invalid JSON; no action was selected.") from None
+                        result = validate_response(raw, questions)
+                    except ResponseValidationError:
+                        # A malformed successful reply is not a game command.
+                        # Retry the same request within the shared attempt cap;
+                        # never repair probabilities or invent a chosen action.
+                        rejected += 1
+                        self.rejected_response_attempts_total += 1
+                        usage = raw.get("usage") if isinstance(raw, dict) else None
+                        known = {name: usage[name] for name in ("input_tokens", "output_tokens")
+                                 if isinstance(usage, dict) and type(usage.get(name)) is int and usage[name] >= 0}
+                        rejected_input += known.get("input_tokens", 0)
+                        rejected_output += known.get("output_tokens", 0)
+                        self.input_tokens_total += known.get("input_tokens", 0)
+                        self.output_tokens_total += known.get("output_tokens", 0)
+                        if len(known) != 2:
+                            rejected_unknown_usage += 1
+                            self.rejected_usage_unavailable_attempts_total += 1
+                        if attempt >= self.max_retries:
+                            raise
+                        self._sleep(min(0.25 * (2 ** attempt), 2.0))
+                        continue
                     self.input_tokens_total += result["usage"]["input_tokens"]
                     self.output_tokens_total += result["usage"]["output_tokens"]
                     result["metadata"] = {
@@ -315,6 +340,10 @@ class TypeSafeClient:
                         "request_count": self.request_count,
                         "input_tokens_total": self.input_tokens_total,
                         "output_tokens_total": self.output_tokens_total,
+                        "rejected_response_attempts": rejected,
+                        "rejected_input_tokens": rejected_input,
+                        "rejected_output_tokens": rejected_output,
+                        "rejected_usage_unavailable_attempts": rejected_unknown_usage,
                     }
                     return result
             if status is not None and (status not in RETRY_STATUSES or attempt >= self.max_retries):

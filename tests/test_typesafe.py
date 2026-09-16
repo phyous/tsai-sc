@@ -118,7 +118,7 @@ class ClientTests(unittest.TestCase):
             with self.subTest(name=name):
                 data = api_response()
                 mutate(data["answers"]["action"])
-                client, transport, _ = self.client(Response(data))
+                client, transport, _ = self.client(Response(data), max_retries=0)
                 with self.assertRaises(ResponseValidationError):
                     client.evaluate({}, QUESTIONS)
                 self.assertEqual(len(transport.requests), 1)
@@ -134,7 +134,7 @@ class ClientTests(unittest.TestCase):
         for mutate in mutations:
             data = api_response()
             mutate(data)
-            client, _, _ = self.client(Response(data))
+            client, _, _ = self.client(Response(data), max_retries=0)
             with self.assertRaises(ResponseValidationError):
                 client.evaluate({}, QUESTIONS)
 
@@ -189,7 +189,7 @@ class ClientTests(unittest.TestCase):
 
     def test_invalid_or_duplicate_json_fails_closed(self):
         for body in (b"not json", b'{"model":"jev-latest","model":"jev-other"}', b"x" * 1_048_577):
-            client, _, _ = self.client(Response(body))
+            client, _, _ = self.client(Response(body), max_retries=0)
             with self.assertRaises(ResponseValidationError):
                 client.evaluate({}, QUESTIONS)
 
@@ -202,6 +202,71 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(ConfigurationError):
             client.evaluate({"x": float("nan")}, QUESTIONS)
         self.assertEqual(transport.requests, [])
+
+    def test_invalid_successful_reply_retries_identical_request_without_repair(self):
+        invalid = api_response()
+        invalid['answers']['action']['probabilities'].pop('wait')
+        client, transport, sleeps = self.client(Response(invalid), Response(api_response()))
+        result = client.evaluate({'minerals': 50}, QUESTIONS)
+        self.assertEqual(len(transport.requests), 2)
+        self.assertEqual(transport.requests[0][0].data, transport.requests[1][0].data)
+        self.assertEqual(result['answers'], api_response()['answers'])
+        self.assertEqual(sleeps, [0.25])
+        self.assertEqual(result['metadata']['attempts'], 2)
+        self.assertEqual(result['metadata']['request_count'], 2)
+        self.assertEqual(result['metadata']['rejected_response_attempts'], 1)
+        self.assertEqual(result['metadata']['rejected_input_tokens'], 300)
+        self.assertEqual(result['metadata']['rejected_output_tokens'], 45)
+        self.assertEqual(result['metadata']['rejected_usage_unavailable_attempts'], 0)
+        self.assertEqual(client.input_tokens_total, 600)
+        self.assertEqual(client.output_tokens_total, 90)
+
+    def test_repeated_invalid_replies_exhaust_bounded_attempts_without_command(self):
+        invalid = api_response()
+        invalid['answers']['action']['probabilities']['train'] = 0.7
+        invalid['private_debug'] = 'REMOTE_BODY_MUST_NOT_APPEAR'
+        client, transport, sleeps = self.client(*(Response(invalid) for _ in range(3)))
+        with self.assertRaises(ResponseValidationError) as caught:
+            client.evaluate({}, QUESTIONS)
+        self.assertEqual(len(transport.requests), 3)
+        self.assertEqual(sleeps, [0.25, 0.5])
+        self.assertEqual(client.rejected_response_attempts_total, 3)
+        self.assertEqual(client.input_tokens_total, 900)
+        rendered = ''.join(traceback.format_exception(caught.exception))
+        self.assertNotIn('REMOTE_BODY_MUST_NOT_APPEAR', rendered)
+        self.assertNotIn('test-placeholder', rendered)
+
+    def test_invalid_response_retries_cannot_exceed_request_cap(self):
+        invalid = api_response()
+        invalid['answers']['action']['confidence'] = -1
+        client, transport, _ = self.client(Response(invalid), max_requests=1)
+        with self.assertRaises(RequestLimitError):
+            client.evaluate({}, QUESTIONS)
+        self.assertEqual(len(transport.requests), 1)
+        self.assertEqual(client.rejected_response_attempts_total, 1)
+
+    def test_unknown_rejected_usage_is_disclosed_without_being_fabricated(self):
+        client, _, _ = self.client(Response(b'not json'), Response(api_response()))
+        result = client.evaluate({}, QUESTIONS)
+        self.assertEqual(result['metadata']['rejected_response_attempts'], 1)
+        self.assertEqual(result['metadata']['rejected_usage_unavailable_attempts'], 1)
+        self.assertEqual(result['metadata']['rejected_input_tokens'], 0)
+        self.assertEqual(client.input_tokens_total, 300)
+        partial = api_response()
+        partial['usage']['output_tokens'] = True
+        client, _, _ = self.client(Response(partial), Response(api_response()))
+        result = client.evaluate({}, QUESTIONS)
+        self.assertEqual(result['metadata']['rejected_input_tokens'], 300)
+        self.assertEqual(result['metadata']['rejected_output_tokens'], 0)
+        self.assertEqual(result['metadata']['rejected_usage_unavailable_attempts'], 1)
+
+    def test_transport_and_invalid_reply_share_one_retry_budget(self):
+        client, transport, sleeps = self.client(URLError('offline'), Response(b'not json'), Response(api_response()))
+        result = client.evaluate({}, QUESTIONS)
+        self.assertEqual(len(transport.requests), 3)
+        self.assertEqual(sleeps, [0.25, 0.5])
+        self.assertEqual(result['metadata']['attempts'], 3)
+        self.assertEqual(result['metadata']['rejected_response_attempts'], 1)
 
     def test_noul_and_score(self):
         questions = {

@@ -26,18 +26,26 @@ cleanup() { for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done; }
 trap cleanup EXIT INT TERM
 (cd .runtime/bottleship && exec bun run dev --host 127.0.0.1 --strictPort) > .runtime/logs/vite.log 2>&1 &
 pids+=("$!")
+vite_pid="$!"
+vite_ready=false
 for _ in {1..100}; do
-  if curl --silent --fail http://127.0.0.1:5174/ >/dev/null 2>&1; then break; fi
+  kill -0 "$vite_pid" 2>/dev/null || { echo 'Vite exited; inspect .runtime/logs/vite.log.' >&2; exit 1; }
+  if curl --silent --fail http://127.0.0.1:5174/ >/dev/null 2>&1; then vite_ready=true; break; fi
   sleep 0.2
 done
+[ "$vite_ready" = true ] || { echo 'Vite did not become ready on port 5174.' >&2; exit 1; }
 "$CHROME" --headless=new --remote-debugging-port=9333 --user-data-dir="$PROFILE_DIR" \
   --no-first-run --no-default-browser-check --autoplay-policy=no-user-gesture-required \
   --enable-unsafe-webgpu --window-size=1400,1050 about:blank > .runtime/logs/chrome.log 2>&1 &
 pids+=("$!")
+chrome_pid="$!"
+chrome_ready=false
 for _ in {1..100}; do
-  if curl --silent --fail http://127.0.0.1:9333/json/version >/dev/null 2>&1; then break; fi
+  kill -0 "$chrome_pid" 2>/dev/null || { echo 'Dedicated Chrome exited; inspect .runtime/logs/chrome.log.' >&2; exit 1; }
+  if curl --silent --fail http://127.0.0.1:9333/json/version >/dev/null 2>&1; then chrome_ready=true; break; fi
   sleep 0.2
 done
+[ "$chrome_ready" = true ] || { echo 'Dedicated Chrome did not become ready on port 9333.' >&2; exit 1; }
 (cd .runtime/bottleship && bun tools/harness.ts up)
 bun engine/bridge.ts &
 pids+=("$!")

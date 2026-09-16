@@ -2,9 +2,9 @@ import struct
 import unittest
 
 from tsai_sc.game import (
-    BUILD_SIGNATURE, BUILD_SIGNATURE_ADDRESS, CAMERA, GAME, GAME_MODE,
+    BUILD_SIGNATURE, BUILD_SIGNATURE_ADDRESS, CAMERA, CLIENT_SELECTION, GAME, GAME_MODE, GAME_PAUSED,
     LOCAL_PLAYER, MAP_IDENTITY, PENDING_VICTORY, TERRAN_SUPPLY, UNIT_BASE,
-    UNIT_SIZE, VICTORY, GameStateError, game_to_screen, read_state,
+    UNIT_SIZE, VICTORY, GameStateError, game_to_screen, read_selection, read_state,
 )
 
 
@@ -44,6 +44,81 @@ class Memory:
 
 
 class DecoderTests(unittest.TestCase):
+    def test_original_pause_flag_is_independent_of_outcome_and_rejects_invalid_values(self):
+        memory = Memory()
+        self.assertIs(read_state(memory.read)["game_paused"], False)
+        memory.put(GAME_PAUSED, "I", 1)
+        state = read_state(memory.read)
+        self.assertIs(state["game_paused"], True)
+        self.assertEqual(state["status"], "running")
+        memory.put(GAME_PAUSED, "I", 2)
+        with self.assertRaises(GameStateError):
+            read_state(memory.read)
+
+    def test_selection_reads_all_client_pointers_and_rejects_invalid_values(self):
+        memory = Memory()
+        self.assertEqual(read_selection(memory.read), [])
+        memory.put(CLIENT_SELECTION, "III", UNIT_BASE, UNIT_BASE + UNIT_SIZE * 7, UNIT_BASE + UNIT_SIZE * 1699)
+        self.assertEqual(read_selection(memory.read), [0, 7, 1699])
+        memory.put(CLIENT_SELECTION, "I", UNIT_BASE + 1)
+        with self.assertRaises(GameStateError):
+            read_selection(memory.read)
+        memory.put(CLIENT_SELECTION, "I", UNIT_BASE + UNIT_SIZE * 7)
+        with self.assertRaises(GameStateError):
+            read_selection(memory.read)
+
+    def strongarm(self):
+        memory = Memory()
+        memory.data[MAP_IDENTITY:MAP_IDENTITY + 292] = bytes(292)
+        path = b"campaign\\terranED\\terran01"
+        memory.data[MAP_IDENTITY:MAP_IDENTITY + len(path)] = path
+        memory.put(GAME + 0xE4, "HH", 96, 64)
+        return memory
+
+    def test_strongarm_exact_map_supports_combat_without_revealing_fog(self):
+        memory = self.strongarm()
+        memory.unit(1, 0, 6, 1100, 600)
+        memory.unit(2, 0, 0, 2500, 1600, visible=False)
+        memory.unit(3, 37, 3, 1300, 600)
+        memory.unit(4, 1, 2, 1200, 650)
+        memory.put(UNIT_BASE + UNIT_SIZE + 0x8F, "B", 2)
+        state = read_state(memory.read)
+        self.assertEqual(state["mission"], "Strongarm")
+        self.assertEqual(state["mission_kind"], "combat")
+        self.assertEqual(state["map"], {"width_tiles": 96, "height_tiles": 64})
+        self.assertEqual(state["enemy_players"], [0, 3])
+        self.assertEqual([unit["id"] for unit in state["units"]], [0, 1, 3, 4])
+        self.assertEqual(state["units"][-2]["relationship"], "enemy")
+        self.assertEqual(state["units"][-1]["relationship"], "ally")
+        self.assertEqual(state["units"][1]["combat_stats"]["base_ground_range_pixels"], 128)
+        self.assertEqual(state["combat"]["visible_enemy_units"], 1)
+        self.assertEqual(state["combat"]["kills_by_surviving_owned_units"], 2)
+        self.assertNotIn("supply_depots", state["objective_progress"])
+        self.assertEqual(state["status"], "running")
+
+    def test_strongarm_requires_exact_dimensions_and_does_not_infer_visible_victory(self):
+        memory = self.strongarm()
+        memory.put(GAME + 0xE4, "HH", 64, 64)
+        with self.assertRaises(GameStateError):
+            read_state(memory.read)
+        memory.put(GAME + 0xE4, "HH", 96, 64)
+        memory.data[VICTORY + 6] = 3
+        state = read_state(memory.read)
+        self.assertEqual(state["status"], "victory")
+        self.assertEqual(state["objective_progress"]["mission_victory"]["current"], 1)
+        self.assertIn("capture and inspect", state["evidence"]["presentation_rule"])
+
+    def test_other_campaign_maps_and_wrong_human_slot_remain_rejected(self):
+        memory = self.strongarm()
+        memory.put(LOCAL_PLAYER, "I", 0)
+        with self.assertRaises(GameStateError):
+            read_state(memory.read)
+        memory.put(LOCAL_PLAYER, "I", 6)
+        path = b"campaign\\terranED\\terran02"
+        memory.data[MAP_IDENTITY:MAP_IDENTITY + len(path)] = path
+        with self.assertRaises(GameStateError):
+            read_state(memory.read)
+
     def test_fog_of_war_and_objective_counts(self):
         memory = Memory()
         memory.unit(1, 37, 0, 80, 80, visible=False)

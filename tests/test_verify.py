@@ -88,8 +88,21 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual(summary['trace_sha256'], self.result['trace_sha256'])
         self.assertIn('not win probabilities', summary['probabilities'])
 
+    def test_usage_includes_rejected_response_attempts_without_counting_them_as_decisions(self):
+        self.decisions[0]['response']['metadata'].update(attempts=2, rejected_response_attempts=1,
+                                                       rejected_input_tokens=280, rejected_usage_unavailable_attempts=0)
+        self.result.update(api_attempts=2, accounted_input_tokens=580)
+        self.write_logs()
+        summary = verify(self.root)
+        self.assertEqual((summary['model_calls'], summary['api_attempts'], summary['input_tokens']), (1, 2, 580))
+        self.assertEqual(summary['rejected_response_attempts'], 1)
+        self.result['accounted_input_tokens'] = 300
+        self.write_result()
+        with self.assertRaisesRegex(ValueError, 'Accounted input usage'):
+            verify(self.root)
+
     def test_malformed_or_nonvictorious_result_is_rejected(self):
-        for contents in ('not json', '{}', '{"status":"victory"}'):
+        for contents in ('not json', '{}', '{"status":"victory"}', '[]', 'null', '{"engine_evidence":[]}'):
             with self.subTest(contents=contents):
                 (self.root / 'result.json').write_text(contents)
                 with self.assertRaises(ValueError):
@@ -103,10 +116,63 @@ class VerificationTests(unittest.TestCase):
                     verify(self.root)
 
     def test_wrong_mission_is_rejected(self):
+        self.result['engine_evidence']['map_path'] = 'campaign\\terranED\\terran02'
+        self.write_result()
+        with self.assertRaisesRegex(ValueError, 'supported original demo mission'):
+            verify(self.root)
+
+    def strongarm(self):
+        self.result['engine_evidence']['map_path'] = 'campaign\\terranED\\terran01'
+        self.result['visible_victory_frame'] = 'frames/TEST.png'
+        self.result['visible_victory_frame_sha256'] = hashlib.sha256((self.root / 'frames/TEST.png').read_bytes()).hexdigest()
+        self.decisions[0]['candidates'] = {'mine': {'kind': 'gather', 'unit': 1, 'target': 2}, 'wait': {'kind': 'wait'}}
+        self.decisions[0]['action'] = dict(self.decisions[0]['candidates']['mine'])
+        self.write_logs()
+
+    def test_combat_execution_is_bound_to_the_model_selected_candidate(self):
+        self.strongarm()
+        self.decisions[0]['action']['target'] = 999
+        self.write_logs()
+        with self.assertRaisesRegex(ValueError, 'model-selected candidate'):
+            verify(self.root)
+
+    def test_strongarm_requires_retained_original_screen_for_human_review(self):
         self.result['engine_evidence']['map_path'] = 'campaign\\terranED\\terran01'
         self.write_result()
-        with self.assertRaisesRegex(ValueError, 'original Boot Camp mission'):
+        with self.assertRaisesRegex(ValueError, 'victory-screen image'):
             verify(self.root)
+        self.strongarm()
+        summary = verify(self.root)
+        self.assertIn('Strongarm combat mission', summary['mission'])
+        self.assertEqual(summary['visible_victory_frame'], 'frames/TEST.png')
+        self.assertTrue(summary['victory_screen_integrity_checked'])
+        # The synthetic fixture is deliberately not mistaken for pixel proof.
+        self.assertIn('does not recognize screen text', summary['visual_review'])
+
+    def test_victory_screen_path_cannot_escape_run_directory(self):
+        self.strongarm()
+        for value in ('../outside.png', '/tmp/outside.png', 'missing.png', ''):
+            with self.subTest(path=value):
+                self.result['visible_victory_frame'] = value
+                self.write_result()
+                with self.assertRaises(ValueError):
+                    verify(self.root)
+
+    def test_victory_screen_hash_is_required_and_detects_changes(self):
+        self.strongarm()
+        self.result['visible_victory_frame_sha256'] = '0' * 64
+        self.write_result()
+        with self.assertRaisesRegex(ValueError, 'image hash differs'):
+            verify(self.root)
+        self.result.pop('visible_victory_frame_sha256')
+        self.write_result()
+        with self.assertRaisesRegex(ValueError, 'image hash differs'):
+            verify(self.root)
+
+    def test_ordinary_modifier_key_input_is_allowed(self):
+        self.decisions[0]['input_result']['inputs'].append({'command': 'key', 'args': ['shift', {'down': True}]})
+        self.write_logs()
+        self.assertEqual(verify(self.root)['outcome'], 'victory')
 
     def test_mission_path_matching_allows_case_and_slashes(self):
         self.result['engine_evidence']['map_path'] = 'CAMPAIGN/TERRANED/TUTORIAL'

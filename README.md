@@ -1,31 +1,39 @@
 # Jev plays StarCraft shareware
 
-A TypeSafe System One harness for the **original StarCraft shareware Boot Camp
-tutorial mission**, with a recording of the game and Jev's actual action
-probabilities. Inspired by [TypeSafe's Doom demo](https://typesafe.ai/blog/introducing-system-one-models-and-jev).
+A TypeSafe System One harness for **Strongarm, the first combat mission in the
+original StarCraft shareware campaign**, with a game recording and Jev's actual
+action probabilities. Inspired by [TypeSafe's Doom demo](https://typesafe.ai/blog/introducing-system-one-models-and-jev).
 
-[![Jev playing original StarCraft with actual action probabilities](docs/demo.png)](https://github.com/phyous/tsai-sc/releases/tag/v0.1.0)
-
-**Verified run:** `jev-1.13.0` completed Boot Camp in 4m57s wall time with 81 model
-decisions and 170 ms median API latency. The [77-second video](https://github.com/phyous/tsai-sc/releases/download/v0.1.0/jev-starcraft-boot-camp.mp4)
-shows the entire run at 4× speed. [Outcome evidence](docs/verified-run.json) records
-the original engine's victory result; the release also includes the full decision
-log. This is one successful run after harness development, not a win-rate benchmark.
+**Combat-run verification is pending.** A published winning run must include the
+original game's visible victory screen, matching engine outcome, decision log,
+and recorded probability distributions. Run results and video links will be
+added after those checks are complete.
 
 The original 1998 Windows executable runs inside [BottleShip](https://github.com/jenissimo/bottleship).
 The harness observes structured game state, asks `jev-latest` to choose a command,
 and executes that choice through ordinary mouse and keyboard inputs. The game is
-paused during state reads and inference. It is not a screenshot-driven model or
-a claim of real-time competitive StarCraft play.
+paused during state reads and inference. This independently implements the
+structured-state decision pattern shown in the Doom demonstration; it does not
+use TypeSafe's Doom harness code. Screenshots are recorded for viewers, while
+the model receives structured observations. This is a bounded mission experiment,
+not a benchmark of real-time competitive play.
 
 ## The mission
 
-Boot Camp requires three completed Supply Depots, one completed Refinery, and
-100 gas. One depot already exists at the start. This is the original tutorial,
-with no combat required. The harness does **not** implement its own victory
-condition: success requires the original executable's committed victory result.
-Completing the objectives starts the original closing transmission; the harness
-waits for that sequence to finish and for the actual victory result to be committed.
+Strongarm's briefing orders the player to **destroy the rebel base** on Chau Sara.
+The original 96×64-tile map contains enemy forces, combat encounters, and scripted
+reinforcements. The player begins with eight Marines, four SCVs, two Barracks,
+a Command Center, four Supply Depots, a Refinery, and an Engineering Bay.
+
+Jev directs combat squads, exploration, mineral gathering, and reinforcement
+production. Enemy locations enter its observations only when visible to the
+player. The original executable runs the opposing forces and mission triggers.
+Success requires its committed victory outcome **and a captured, visually checked
+original victory dialog**. The recorder continues after the outcome changes so
+the game's result screen can appear.
+
+Boot Camp remains available as an optional economy/input-adapter test mission.
+The default run target is Strongarm.
 
 ## Run it
 
@@ -44,7 +52,7 @@ Leave the runtime terminal open. In a second terminal:
 
 ```sh
 source .venv/bin/activate
-python -m tsai_sc.boot
+python -m tsai_sc.boot --mission strongarm
 
 # Save your own key in a private file outside the repository; chmod 600 it.
 # The file contains a single TYPESAFE_API_KEY=... assignment.
@@ -54,9 +62,13 @@ python -m tsai_sc.run \
   --max-requests 400 --max-seconds 1200
 
 python -m tsai_sc.render runs/my-attempt \
-  --output recordings/boot-camp.mp4 --speed 4 --fps 30
+  --output recordings/strongarm.mp4 --speed 4 --fps 30
 python -m tsai_sc.verify runs/my-attempt
 ```
+
+Inspect `runs/my-attempt/victory-screen.png` for the original victory dialog
+before publishing a winning-run claim. To restart a stopped controller's current
+mission through the game menus, use `python -m tsai_sc.boot --restart`.
 
 Alternatively, provide `TYPESAFE_API_KEY` in the environment. Requests go only to
 TypeSafe's fixed HTTPS API endpoint. Request limits include retry attempts, and
@@ -72,7 +84,7 @@ under ignored `.runtime/`. It does not attach to your personal browser. See
 ```text
 Original game memory (read only)
           ↓
-Own units + visible resources + economy + mission progress
+Own units + visible enemies/resources + economy + recent observed positions
           ↓
 Bounded candidate commands and recent execution feedback
           ↓
@@ -83,17 +95,41 @@ Deterministic selection / camera / mouse / hotkey adapter
 Original StarCraft simulation and mission triggers
 ```
 
-Jev chooses whether to gather minerals or gas, train an SCV, build a depot or
-refinery, or let existing orders continue. The harness supplies known costs,
-prerequisites, nearby targets, a small set of tile-aligned construction sites,
-and ordinary input sequences. This engineering is part of the experiment:
-Jev chooses among actions supplied by the harness, rather than discovering the
-game's interface from scratch. Hidden enemies are excluded; owned units remain
-observable. Workers inside refineries and unfinished units cannot be selected.
+Each API request presents one finite Choice question. Its options are the exact
+available commands at that moment; the visualizer displays the returned
+probability distribution over those options.
 
-The adapter records dispatch and observed acceptance separately. It never writes
-guest memory, grants resources, constructs units directly, or changes mission
-triggers. No script overrides a model decision to force a win.
+| Model choice | Candidate supplied by the harness | Original game controls |
+| --- | --- | --- |
+| Focus fire | A currently visible hostile unit or building | Select squad, `A`, click target |
+| Attack toward enemies | A visible enemy group's position | Select squad, `A`, click ground |
+| Explore | A bounded north/east/south/west advance from the squad | Select squad, `A`, click ground |
+| Retreat or regroup | A point away from a visible threat, an observed friendly base, or the friendly force's center | Select squad, `M`, click ground |
+| Gather minerals | An available SCV and an observed mineral field | Select SCV, right-click minerals |
+| Train Marine or SCV | An idle compatible producer with sufficient minerals and supply | Select Barracks or Command Center, `M` or `S` |
+| Build Supply Depot | An available SCV and an open candidate site near the friendly base | Select SCV, `B`, `S`, click placement |
+| Continue current orders | Keep persistent orders in progress | No new input |
+
+The deterministic adapter groups nearby selectable combat units into squads of
+at most twelve, selects them with ordinary clicks and Shift-clicks, pans the
+camera, and checks the game's resulting selection. It supplies up to eight
+squads, four nearest visible focus targets per squad, known costs, prerequisites,
+and tile-aligned construction candidates. Exploration geometry uses the squad's
+observed position and map bounds; the game determines terrain passability.
+Recent observed friendly positions help Jev track where it has already moved.
+
+Economy options cap the offered workforce at twelve SCVs and the Marine force
+at seventy-two, with one queued unit per producer. Depots are offered near the
+supply limit, with one unfinished depot at a time. Workers inside refineries,
+unfinished units, and workers already constructing cannot be retasked through
+these options. This action-space design is part of the experiment: Jev selects
+among supplied commands, and the adapter translates that selection into input.
+
+The adapter records dispatch, actual selected units, and observed order acceptance
+separately. Acceptance is evidence of an order in progress, not proof of arrival
+or tactical success. Guest memory is read only; resources, units, damage, movement,
+and victory remain under the original game's control. There is no substitute
+policy that overrides Jev's selected command.
 
 ## Recording and evidence
 
@@ -104,8 +140,19 @@ Each attempt contains:
   normal input events, and observed command results.
 - `trace.jsonl` and `frames/`: timestamped game-only frames and the last observed
   decision/state used by the visualizer.
-- `result.json`: original engine outcome, final state, counts, and trace hashes.
+- `victory-screen.png`: the original game's result presentation after the outcome
+  transition, retained for visual inspection.
+- `result.json`: original engine outcome, final state, counts, trace/decision
+  hashes, and the retained result-screen image's path and hash.
+
 Interrupted or failed runs instead receive `incomplete.json`.
+
+The verifier checks the exact supported mission, committed outcome, trace and
+decision integrity, agreement between selected commands and model choices, and
+the ordinary-input allowlist. For Strongarm it also requires a result-screen
+image confined to the run directory with a matching hash. It does **not** recognize
+victory text in pixels; a person must inspect the original screen before the run
+is presented as a visible victory.
 
 The video shows **action probabilities**, not estimated chances of winning. It
 labels playback speed and decision pauses. Model probabilities are preserved
@@ -126,7 +173,8 @@ python scripts/audit_public.py
 
 Tests cover malformed model responses, retry/request limits, credential handling,
 original-game memory decoding, visibility and win detection, command prerequisites,
-placement coordinates, and real FFmpeg output timing/format. Runtime boot and
+squad selection, modifier release, mission-specific camera geometry, placement
+coordinates, evidence integrity, and real FFmpeg output timing/format. Runtime boot and
 gameplay also require integration verification against the pinned demo executable.
 
 ## Credits and rights
