@@ -1,6 +1,6 @@
 # Lessons from developing the harness
 
-These notes describe failed Strongarm attempts through attempt 11 and subsequent
+These notes describe development attempts through attempt 12 and subsequent
 changes and probes. They do not establish a combat victory or a measured improvement in
 win rate. Code checks, controlled game tests, and strategy hypotheses provide
 different kinds of evidence.
@@ -58,6 +58,11 @@ different kinds of evidence.
    tests, a 100 ms mouse hold still missed a moving Marine; a 1 ms selection tap
    selected it. Subsequent live checks selected exactly eight idle Marines,
    eight moving Marines, and a four-Marine moving subset, with no retries.
+   A later live test reproduced a stationary Marine hidden behind Barracks
+   artwork: a point click missed it, but an 8×8-pixel Shift-drag recovered the
+   missing member and yielded exactly the twelve requested units. The bounded
+   second-pass selection-box fallback retains the full-set guard, including
+   rejection of any extra selected unit.
    These checks validate those cases, not every possible overlap or battle.
    See [selection code](../tsai_sc/controller.py) and
    [selection regressions](../tests/test_controller.py).
@@ -172,5 +177,59 @@ different kinds of evidence.
     screenshot pixel-for-pixel. Four successive live captures changed as the
     game advanced, taking 23–24 ms each, and five capture tests validate PNG
     integrity, colors, stride, source selection, and bounded input handling.
-    The next full run tests both changes together. Neither aborted recording
-    establishes a combat victory.
+    During attempt 12, a 180-second active rendering soak produced 26,956
+    additional 8-bit frame presentations. All four samples reported zero
+    pending conversion buffers. The same GPU process remained alive, with
+    resident memory increasing by 592 KiB (about 0.6 MiB) between the first and
+    last samples. Resident memory is not total GPU allocation or compressed
+    memory. This bounded test supports the repair; it does not establish
+    indefinite stability or a combat victory.
+
+12. **A formed army still needs to assess the defenders.** Attempt 12's first
+    twelve-Marine assault lost its entire cohort between calls 68 and 71,
+    spanning 244 game frames. Selection was complete: the first command focused
+    the Academy, followed by an advance toward the Command Center. The Academy
+    lost 55 HP while all eleven initially visible armed defenders remained
+    observable; only one of those defenders had lost HP. This establishes a
+    costly assault, but does not isolate target priority, approach geometry,
+    or Firebat splash as the sole cause.
+
+    Observations now distinguish armed defenders, attack-capable workers, and
+    unarmed structures, and summarize local composition, HP, and known base
+    ranges. Guidance accounts for Firebat splash and the difference between
+    assembly and sufficient strength. [Battle memory](../tsai_sc/battle.py)
+    preserves up to four recent encounters from exact ID/generation snapshots.
+    It reports owned identities no longer observed near previously visible
+    hostiles, without asserting why they disappeared. Defender composition
+    comes from one actual sighting, not accumulated counts presented as a
+    simultaneous army; current enemy positions and survival remain uncertain.
+    See [battle-memory tests](../tests/test_battle.py) and
+    [combat observation tests](../tests/test_combat.py).
+
+    Separate API probes on frozen attempt 12 states changed call 68's Academy
+    focus to a Marine focus, call 69's Command Center advance to retreat, and
+    call 90's Barracks construction to regrouping. These probes issued no game
+    input. They demonstrate different choices with revised observations and
+    guidance, not successful execution, isolated causality, or improved win rate.
+
+13. **Input semantics and recovery options need live checks.** Attack-move and
+    exploration now use `A` plus a minimap destination. A viewport click can hit
+    a building sprite instead of the intended ground. A separate live probe
+    aimed at the friendly Command Center produced original attack-move order
+    14 with no unit-target pointer, confirming ground-order semantics. Focus
+    fire retains a visible target click.
+
+    Economy actors now use the same paused 1 ms selection tap as combat units,
+    followed by an exact-actor check before any hotkey. Construction search
+    covers bounded rings and intermediate directions around the observed base;
+    recently rejected sites receive a temporary cooldown. A live probe started
+    a Barracks at an available northern site. This proves that placement, not
+    that every candidate has legal terrain.
+
+    The menu also offers infantry weapons level 1 at an Engineering Bay for
+    100 minerals and 100 gas, at most once after an accepted order per run.
+    A live probe observed the 100-gas deduction and original upgrade order 76.
+    That verifies research initiation, not completed research. These isolated
+    input checks are separate from Jev's recorded gameplay and establish no
+    combat victory. See [input translation](../tsai_sc/controller.py) and
+    [control regressions](../tests/test_controller.py).

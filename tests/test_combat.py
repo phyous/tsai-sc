@@ -4,6 +4,9 @@ import copy
 import json
 import math
 import unittest
+from unittest.mock import patch
+
+from tsai_sc.battle import history_snapshot
 
 from tsai_sc.combat import (
     CombatKind, CombatStateError, KnownRegion, MissionConfig, STRONGARM,
@@ -49,6 +52,71 @@ class CombatTests(unittest.TestCase):
         for key, action in actions.items():
             if action["kind"] != "continue":
                 self.assertEqual(questions["action"]["criteria"][key], action["label"])
+
+    def test_armed_defenders_workers_and_unarmed_buildings_have_distinct_roles(self):
+        observed = state()
+        observed["units"].extend([
+            unit(20, 112, owner=0, x=480, hp=600, name="Academy"),
+            unit(21, owner=0, x=520),
+            unit(22, 32, owner=0, x=550, hp=50, name="Firebat"),
+            unit(23, 7, owner=0, x=560, hp=60, name="SCV"),
+            unit(24, 125, owner=0, x=590, hp=350, name="Bunker"),
+            unit(25, owner=0, x=2800),
+            unit(26, owner=0, x=460, visible=False),
+        ])
+        actions = candidates(observed)
+        model, questions, _ = graph_request_for(observed, actions)
+        focus = {action["target"]: action for action in actions.values() if action["kind"] == "attack_target"}
+        self.assertEqual(set(focus), {20, 21, 22, 23})  # All previous nearest choices remain.
+        self.assertIn("unarmed production/support structure", focus[20]["label"])
+        self.assertIn("does not suppress nearby defenders", focus[20]["label"])
+        self.assertIn("base ground range 128px", focus[21]["label"])
+        self.assertIn("close-range splash", focus[22]["label"])
+        self.assertIn("attack-capable worker", focus[23]["label"])
+        threats = model["squads"][0]["local_visible_ground_threats"]
+        self.assertEqual(threats["visible_armed_combat_count"], 2)
+        self.assertEqual(threats["visible_armed_combat_hp"], 90)
+        self.assertEqual(threats["visible_attack_capable_worker_count"], 1)
+        self.assertEqual(threats["visible_attack_capable_worker_hp"], 60)
+        self.assertEqual(threats["visible_unarmed_structure_count"], 1)
+        self.assertEqual(threats["visible_unknown_ground_capability_count"], 1)
+        self.assertEqual(threats["known_enemy_base_ground_ranges"], {"Marine": 128, "Firebat": 32, "SCV": 10})
+        self.assertEqual(threats["squad_hp"], 80)
+        self.assertIn("not sufficient strength", questions["intent"]["instructions"])
+        self.assertIn("recent_battle_outcomes", questions["intent"]["instructions"])
+        self.assertIn("splash", model["combat_guidance"])
+        bunker = next(unit for unit in model["squads"][0]["visible_enemies_nearest_first"] if unit["id"] == 24)
+        self.assertIsNone(bunker["combat_role"]["can_attack_ground"])
+
+    def test_visible_enemy_stats_do_not_promote_static_unknowns_to_unarmed(self):
+        observed = state()
+        observed["units"].extend([unit(20, 150, owner=0, x=450, hp=1000, name="Unclassified Structure"),
+                                   unit(21, 124, owner=0, x=480, hp=200, name="Missile Turret")])
+        model, _ = request_for(observed, candidates(observed))
+        enemies = {u["id"]: u for u in model["squads"][0]["visible_enemies_nearest_first"]}
+        self.assertIsNone(enemies[20]["combat_role"]["can_attack_ground"])
+        self.assertFalse(enemies[21]["combat_role"]["can_attack_ground"])
+        self.assertIn("anti-air", enemies[21]["combat_role"]["role"])
+
+    def test_recent_observed_battle_loss_is_integrated_without_restoring_hidden_targets(self):
+        prior = state()
+        prior["enemy_players"] = [0, 3]
+        prior["units"].append(unit(20, 32, owner=0, x=550, hp=50, name="Firebat"))
+        for actor in prior["units"]:
+            actor["generation"] = 1
+        history = [{"combat_snapshot": history_snapshot(prior, STRONGARM.combat_types)}]
+        observed = copy.deepcopy(prior)
+        observed["frame"] = 400
+        observed["units"] = [u for u in observed["units"] if u["id"] not in {1, 2}]
+        observed["units"][-1]["visible"] = False
+        observed["units"].append({**unit(50, x=1000), "generation": 1})
+        actions = candidates(observed, history=history)
+        model, _ = request_for(observed, actions, history)
+        outcome = model["recent_battle_outcomes"][0]
+        self.assertEqual(outcome["own_units_no_longer_observed"], 2)
+        self.assertEqual(outcome["previously_visible_armed_composition"], {"Firebat": 1})
+        self.assertIn("do not establish current", outcome["current_enemy_uncertainty"])
+        self.assertFalse(any(action["kind"] == "attack_target" for action in actions.values()))
 
     def test_allied_and_neutral_units_are_never_hostile_targets(self):
         observed = state()
@@ -164,6 +232,56 @@ class CombatTests(unittest.TestCase):
         self.assertIn("economy", model)
         observed["minerals"] = 49
         self.assertFalse(any(action["kind"] == "train" for action in candidates(observed).values()))
+
+    def test_infantry_weapons_upgrade_is_one_concrete_economy_command(self):
+        observed = state()
+        observed["gas"] = 100
+        observed["supply"] = {"used": 10, "available": 10}  # Research does not consume supply.
+        observed["units"].append(unit(30, 122, x=650, name="Engineering Bay"))
+        actions = candidates(observed)
+        upgrade = actions["Upgrade infantry weapons"]
+        self.assertEqual({key: upgrade[key] for key in ("kind", "unit", "units", "upgrade", "mineral_cost", "gas_cost")},
+                         {"kind": "upgrade", "unit": 30, "units": [30], "upgrade": "infantry_weapons", "mineral_cost": 100, "gas_cost": 100})
+        self.assertNotIn("point", upgrade)
+        self.assertIn("when research completes", upgrade["label"])
+        model, questions, routing = graph_request_for(observed, actions)
+        self.assertIn("Upgrade infantry weapons", routing["branches"]["Economy"]["candidate_ids"])
+        self.assertEqual(questions["action_economy"]["criteria"]["Upgrade infantry weapons"], upgrade["label"])
+        self.assertFalse(model["economy"]["infantry_weapons_order_previously_accepted"])
+        self.assertEqual(model["economy"]["visible_engineering_bays"], [{"id": 30, "completed": True, "upgrading_order_active": False}])
+
+    def test_upgrade_cost_busy_actor_and_accepted_history_bound_availability(self):
+        baseline = state()
+        baseline["gas"] = 100
+        baseline["units"].append(unit(30, 122, x=650, name="Engineering Bay"))
+        for field, amount in (("gas", 99), ("minerals", 99)):
+            observed = copy.deepcopy(baseline)
+            observed[field] = amount
+            self.assertNotIn("Upgrade infantry weapons", candidates(observed))
+        for fields in ({"order_id": 76}, {"completed": False}, {"visible": False}):
+            observed = copy.deepcopy(baseline)
+            observed["units"][-1].update(fields)
+            self.assertNotIn("Upgrade infantry weapons", candidates(observed))
+        accepted = {"kind": "upgrade", "upgrade": "infantry_weapons", "issued": True, "accepted": True, "frame": 200}
+        self.assertNotIn("Upgrade infantry weapons", candidates(baseline, history=[accepted]))
+        nested = {"action": {"kind": "upgrade", "upgrade": "infantry_weapons"}, "issued": True, "accepted": True}
+        self.assertNotIn("Upgrade infantry weapons", candidates(baseline, history=[nested]))
+        for change in ({"issued": False}, {"accepted": False}, {"upgrade": "infantry_armor"}):
+            self.assertIn("Upgrade infantry weapons", candidates(baseline, history=[{**accepted, **change}]))
+
+    def test_forged_upgrade_actor_cost_or_kind_fails_request_validation(self):
+        observed = state()
+        observed["gas"] = 100
+        observed["units"].append(unit(30, 122, x=650, name="Engineering Bay"))
+        actions = candidates(observed)
+        for change in ({"unit": 3, "units": [3]}, {"upgrade": "infantry_armor"}, {"mineral_cost": 0}, {"gas_cost": 0}):
+            forged = copy.deepcopy(actions)
+            forged["Upgrade infantry weapons"].update(change)
+            with self.subTest(change=change), self.assertRaises(CombatStateError):
+                request_for(observed, forged)
+        history = [{"kind": "upgrade", "upgrade": "infantry_weapons", "issued": True, "accepted": True}]
+        with self.assertRaises(CombatStateError):
+            request_for(observed, actions, history)
 
     def test_supply_construction_and_existing_orders_gate_redundant_economy(self):
         observed = state()
@@ -428,6 +546,40 @@ class CombatTests(unittest.TestCase):
         observed["units"] = [u for u in observed["units"] if u["type_id"] != 111]
         observed["units"][3]["completed"] = False
         self.assertFalse(buildings())
+
+    def test_failed_issued_build_cooldown_filters_exact_site_before_shortlisting(self):
+        observed = state()
+        sites = [{"x": 480, "y": 464}, {"x": 512, "y": 464}, {"x": 544, "y": 464}]
+        failure = {"kind": "build", "building": 111, "point": {**sites[0], "debug_secret": "never copy"},
+                   "frame": 250, "issued": True, "accepted": False}
+        with patch("tsai_sc.combat.building_sites", return_value=sites):
+            actions = candidates(observed, history=[failure])
+            offered = [action["point"] for action in actions.values() if action.get("building") == 111]
+            self.assertEqual(offered, sites[1:])
+            model, _ = request_for(observed, actions, [failure])
+            self.assertEqual(model["economy"]["recent_failed_build_sites"], [
+                {"building": 111, "point": sites[0], "failed_on_frame": 250, "retry_after_frame": 970}])
+            # A selection refusal, accepted placement, different building or future
+            # event is not evidence that this Barracks site failed placement.
+            for change in ({"issued": False}, {"accepted": True}, {"building": 109}, {"frame": 301}):
+                with self.subTest(change=change):
+                    offered = [action["point"] for action in candidates(observed, history=[{**failure, **change}]).values()
+                               if action.get("building") == 111]
+                    self.assertEqual(offered, sites[:2])
+            observed["frame"] = 970
+            self.assertEqual([action["point"] for action in candidates(observed, history=[failure]).values()
+                              if action.get("building") == 111], sites[:2])
+
+    def test_supply_depot_cooldown_keeps_other_types_and_points_available(self):
+        observed = state()
+        observed["supply"] = {"used": 10, "available": 10}
+        sites = [{"x": 464, "y": 448}, {"x": 496, "y": 448}, {"x": 528, "y": 448}]
+        history = [{"frame": 299, "issued": True, "accepted": False,
+                    "action": {"kind": "build", "building": 109, "point": sites[0]}}]
+        with patch("tsai_sc.combat.depot_sites", return_value=sites), patch("tsai_sc.combat.building_sites", return_value=sites):
+            actions = candidates(observed, history=history)
+            self.assertEqual([action["point"] for action in actions.values() if action.get("building") == 109], sites[1:])
+            self.assertEqual([action["point"] for action in actions.values() if action.get("building") == 111], sites[:2])
 
     def test_structure_memory_offers_uncertain_ground_advance_not_hidden_focus_fire(self):
         observed = state()

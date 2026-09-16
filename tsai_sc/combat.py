@@ -15,6 +15,8 @@ import math
 from typing import Literal, NotRequired, TypedDict
 
 from .controller import BUILDING_ORDERS, GAS_ORDERS, MINERAL_ORDERS, building_sites, depot_sites, supply
+from .battle import recent_battle_outcomes
+from .game import BASE_COMBAT_STATS
 
 
 class CombatKind(str, Enum):
@@ -27,6 +29,7 @@ class CombatKind(str, Enum):
     GATHER = "gather"
     TRAIN = "train"
     BUILD = "build"
+    UPGRADE = "upgrade"
 
 
 class Point(TypedDict):
@@ -47,6 +50,8 @@ class CombatAction(TypedDict):
     train_type: NotRequired[int]
     building: NotRequired[int]
     mineral_cost: NotRequired[int]
+    gas_cost: NotRequired[int]
+    upgrade: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -83,6 +88,18 @@ MISSION_PLAYBOOK = (
     "Assemble roughly 8–12 Marines together before an unsupported exploration or assault. A squad with at least 8 combat units within 192 pixels of an observed member has a coherent core: assembly is already achieved there, even away from base. This formation measurement does not guarantee combat strength or passability; consider composition, health and visible threats. After losses, rebuild and bring small reinforcements together rather than feeding isolated units forward. Immediate defense can take priority.",
     "Advance a formed force toward observed objectives or unexplored terrain while income and replacements continue. New reinforcements or another distant squad do not invalidate its assembly. Preserve productive attack-move orders; pathfinding can temporarily move away from the destination or stretch a formation, so distance or spread alone does not prove failure. A return to base is a withdrawal, not a prerequisite to every advance. Regroup when the measured formation needs it, or withdraw for a tactical reason such as danger or losses. Squad names can change: compare actual members, core strength and orders. No fixed route is supplied.",
 )
+
+COMBAT_GUIDANCE = (
+    "A core of eight or more measures formation, not superiority over the observed defense. Compare local visible armed units, HP, composition and known base ranges, including attack-capable workers and uncertain defensive structures. "
+    "Deal with immediate armed threats before committing Marines to durable unarmed buildings such as an Academy; focusing a building lets surviving defenders continue firing. "
+    "Marines have base range 128px versus Firebats' 32px; preserve range and avoid crowding into close-range Firebat splash. Retreat or reinforce when current local strength is inadequate. "
+    "Use recent_battle_outcomes to reconsider an approach associated with observed losses before repeating it with comparable strength. Past hostile sightings do not establish present enemy strength or the cause of unit disappearance. All commands remain model choices."
+)
+
+_FAILED_BUILD_COOLDOWN_FRAMES = 720
+_UNARMED_TERRAN_STRUCTURES = frozenset({106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 120, 122, 123})
+_GROUND_ATTACKERS = frozenset({0, 1, 2, 3, 5, 7, 8, 12, 16, 20, 32, 37, 38, 41, 64, 65})
+_ATTACK_CAPABLE_WORKERS = frozenset({7, 41, 64})
 
 
 class CombatStateError(ValueError):
@@ -200,6 +217,88 @@ def _formation(squad: list[dict]) -> dict:
     }
 
 
+def _combat_role(unit: dict) -> dict:
+    """Known unit-type mechanics, never inferred from hidden orders or occupants."""
+    kind = unit["type_id"]
+    if kind in _UNARMED_TERRAN_STRUCTURES:
+        return {"role": "unarmed production/support structure", "can_attack_ground": False,
+                "note": "No direct weapon; nearby defenders can still attack while this building is targeted."}
+    if kind == 124:
+        return {"role": "anti-air defensive structure", "can_attack_ground": False,
+                "note": "Missile Turrets attack air targets, not ground Marines."}
+    if kind == 125:
+        return {"role": "potentially armed garrison structure", "can_attack_ground": None,
+                "note": "Bunker occupants may attack; occupancy is not inferred from seeing the structure."}
+    if kind in _GROUND_ATTACKERS:
+        result = {"role": "attack-capable worker" if kind in _ATTACK_CAPABLE_WORKERS else "armed combat unit",
+                  "can_attack_ground": True}
+        if kind in BASE_COMBAT_STATS:
+            result["base_ground_range_pixels"] = BASE_COMBAT_STATS[kind]["base_ground_range_pixels"]
+            result["base_ground_damage"] = BASE_COMBAT_STATS[kind]["base_ground_damage"]
+        result["note"] = ("Short-range splash threatens clustered Marines; base weapon values do not include upgrades." if kind == 32 else
+                          "Worker can attack at close range; its current economic order does not remove that capability." if kind in _ATTACK_CAPABLE_WORKERS else
+                          "Base weapon values, when known, do not include upgrades or predict damage per second.")
+        return result
+    return {"role": "combat capability not classified", "can_attack_ground": None,
+            "note": "Unknown capability is not evidence that this unit is harmless."}
+
+
+def _local_threats(squad: list[dict], own: list[dict], enemies: list[dict], mission: MissionConfig) -> dict:
+    local = [unit for unit in enemies if min(_distance(unit, member) for member in squad) <= 512]
+    armed = [unit for unit in local if _combat_role(unit)["can_attack_ground"] is True and unit["type_id"] not in _ATTACK_CAPABLE_WORKERS]
+    workers = [unit for unit in local if unit["type_id"] in _ATTACK_CAPABLE_WORKERS]
+    friendly = [unit for unit in own if unit["type_id"] in mission.combat_types and unit.get("completed") is True
+                and min(_distance(unit, member) for member in squad) <= 512]
+    return {
+        "neighborhood_radius_pixels": 512, "distance_basis": "Within 512px of any current squad member.",
+        "squad_count": len(squad), "squad_hp": sum(unit["hp"] for unit in squad),
+        "nearby_owned_combat_count_including_squad": len(friendly), "nearby_owned_combat_hp": sum(unit["hp"] for unit in friendly),
+        "visible_armed_combat_count": len(armed), "visible_armed_combat_hp": sum(unit["hp"] for unit in armed),
+        "visible_armed_composition": dict(Counter(unit.get("type", str(unit["type_id"])) for unit in armed)),
+        "visible_attack_capable_worker_count": len(workers), "visible_attack_capable_worker_hp": sum(unit["hp"] for unit in workers),
+        "visible_unarmed_structure_count": sum(unit["type_id"] in _UNARMED_TERRAN_STRUCTURES for unit in local),
+        "visible_unknown_ground_capability_count": sum(_combat_role(unit)["can_attack_ground"] is None for unit in local),
+        "known_enemy_base_ground_ranges": {unit.get("type", str(unit["type_id"])): BASE_COMBAT_STATS[unit["type_id"]]["base_ground_range_pixels"]
+                                             for unit in armed + workers if unit["type_id"] in BASE_COMBAT_STATS},
+        "interpretation": "Observed geometry and current HP, not simultaneous firing range, DPS or predicted victory. Unseen defenders and upgrades are unknown; coherence alone is not sufficient combat strength.",
+    }
+
+
+def _failed_build_sites(state: dict, history: list[dict] | None) -> list[dict]:
+    now = state.get("frame")
+    if type(now) is not int:
+        return []
+    width, height = _bounds(state)
+    failed = {}
+    for event in history or []:
+        if not isinstance(event, dict) or event.get("issued") is not True or event.get("accepted") is not False:
+            continue
+        action = event.get("action", event)
+        frame = event.get("frame")
+        if not isinstance(action, dict) or action.get("kind") != "build" or action.get("building") not in {109, 111}:
+            continue
+        point = action.get("point")
+        if (type(frame) is not int or not 0 <= now - frame < _FAILED_BUILD_COOLDOWN_FRAMES or not isinstance(point, dict)
+                or type(point.get("x")) is not int or type(point.get("y")) is not int
+                or not 0 <= point["x"] < width or not 0 <= point["y"] < height):
+            continue
+        key = (action["building"], point["x"], point["y"])
+        if key not in failed or frame > failed[key]["failed_on_frame"]:
+            failed[key] = {"building": action["building"], "point": {"x": point["x"], "y": point["y"]}, "failed_on_frame": frame,
+                           "retry_after_frame": frame + _FAILED_BUILD_COOLDOWN_FRAMES}
+    return sorted(failed.values(), key=lambda event: (-event["failed_on_frame"], event["building"], event["point"]["x"], event["point"]["y"]))
+
+
+def _weapons_upgrade_ordered(history: list[dict] | None) -> bool:
+    for event in history or []:
+        if not isinstance(event, dict) or event.get("issued") is not True or event.get("accepted") is not True:
+            continue
+        action = event.get("action", event)
+        if isinstance(action, dict) and action.get("kind") == "upgrade" and action.get("upgrade") == "infantry_weapons":
+            return True
+    return False
+
+
 def _put(actions: dict[str, CombatAction], title: str, action: CombatAction) -> None:
     key = title
     number = 2
@@ -249,7 +348,7 @@ def _known_enemy_structures(state: dict, enemies: list[dict], history: list[dict
     return memories
 
 
-def _economy_candidates(state: dict, own: list[dict], actions: dict[str, CombatAction]) -> None:
+def _economy_candidates(state: dict, own: list[dict], actions: dict[str, CombatAction], history: list[dict] | None) -> None:
     workers = [unit for unit in own if unit["type_id"] == 7 and unit.get("completed") is True and unit.get("visible") is True]
     minerals = [unit for unit in state["units"] if unit.get("type_id") in {176, 177, 178}
                 and unit.get("visible") is True and unit.get("hp", 0) > 0]
@@ -289,9 +388,21 @@ def _economy_candidates(state: dict, own: list[dict], actions: dict[str, CombatA
                 _put(actions, "Train SCV", {"kind": CombatKind.TRAIN.value, "label": "Train one SCV at an idle Command Center (50 minerals, 1 supply)",
                                             "units": [producer["id"]], "unit": producer["id"], "train_type": 7, "mineral_cost": 50})
                 offered_train_types.add(7)
+    if amount >= 100 and state.get("gas", 0) >= 100 and not _weapons_upgrade_ordered(history):
+        engineering_bays = sorted((unit for unit in own if unit["type_id"] == 122 and unit.get("completed") is True
+                                  and unit.get("visible") is True and unit.get("order_id") != 76), key=lambda unit: unit["id"])
+        if engineering_bays:
+            bay = engineering_bays[0]
+            _put(actions, "Upgrade infantry weapons", {
+                "kind": CombatKind.UPGRADE.value,
+                "label": "Start infantry weapons level 1 at the observed Engineering Bay (100 minerals, 100 gas). Improves infantry weapon damage when research completes; does not immediately finish the upgrade or change army orders.",
+                "units": [bay["id"]], "unit": bay["id"], "upgrade": "infantry_weapons", "mineral_cost": 100, "gas_cost": 100,
+            })
     depot_underway = any(unit["type_id"] == 109 and unit.get("completed") is not True for unit in own)
+    failed = {(event["building"], event["point"]["x"], event["point"]["y"]) for event in _failed_build_sites(state, history)}
     if amount >= 100 and capacity - used <= 3 and not depot_underway and available_workers:
-        for index, point in enumerate(depot_sites(state)[:2], 1):
+        available_sites = [point for point in depot_sites(state) if (109, point["x"], point["y"]) not in failed]
+        for index, point in enumerate(available_sites[:2], 1):
             worker = min(available_workers, key=lambda unit: _distance(unit, point))
             _put(actions, f"Build Supply Depot: site {index}", {
                 "kind": CombatKind.BUILD.value, "label": f"Build a Supply Depot at open candidate site {index} near the friendly base (100 minerals, adds 8 supply)",
@@ -300,7 +411,8 @@ def _economy_candidates(state: dict, own: list[dict], actions: dict[str, CombatA
     barracks = [unit for unit in own if unit["type_id"] == 111]
     if (amount >= 150 and len(barracks) < 3 and not any(unit.get("completed") is not True for unit in barracks)
             and available_workers):
-        for index, point in enumerate(building_sites(state, 111)[:2], 1):
+        available_sites = [point for point in building_sites(state, 111) if (111, point["x"], point["y"]) not in failed]
+        for index, point in enumerate(available_sites[:2], 1):
             worker = min(available_workers, key=lambda unit: _distance(unit, point))
             _put(actions, f"Build Barracks: site {index}", {
                 "kind": CombatKind.BUILD.value,
@@ -339,7 +451,13 @@ def candidates(state: dict, mission: MissionConfig = STRONGARM, history: list[di
             enemy_name = str(enemy.get("type", "enemy unit"))
             direction = _direction(center, enemy)
             title = f"{name}: focus {enemy_name} {direction}"
-            _put(actions, title, {"kind": CombatKind.ATTACK_TARGET.value, "label": f"{name}: focus fire on visible enemy {enemy_name} {direction} ({enemy['hp']} HP)",
+            role = _combat_role(enemy)
+            role_description = role["role"] + (f"; base ground range {role['base_ground_range_pixels']}px" if "base_ground_range_pixels" in role else "")
+            if enemy["type_id"] == 32:
+                role_description += "; close-range splash"
+            elif enemy["type_id"] in _UNARMED_TERRAN_STRUCTURES:
+                role_description += "; focusing this does not suppress nearby defenders"
+            _put(actions, title, {"kind": CombatKind.ATTACK_TARGET.value, "label": f"{name}: focus fire on visible enemy {enemy_name} {direction} ({enemy['hp']} HP; {role_description})",
                                  "units": unit_ids.copy(), "squad": name, "target": enemy["id"], "target_label": enemy_name, "point": _point(enemy)})
         if nearby_enemies:
             enemy = nearby_enemies[0]
@@ -413,7 +531,7 @@ def candidates(state: dict, mission: MissionConfig = STRONGARM, history: list[di
                 action["label"] = action["label"].replace(name + ":", description + ":", 1)
     if len(actions) > 255:
         raise CombatStateError("The combat action menu exceeds the model's choice limit.")
-    _economy_candidates(state, own, actions)
+    _economy_candidates(state, own, actions, history)
     if len(actions) > 255:
         raise CombatStateError("The combined combat/economy menu exceeds the model's choice limit.")
     return actions
@@ -424,6 +542,7 @@ def _unit_summary(unit: dict, origin: dict | None = None, *, owned: bool) -> dic
               "position": _point(unit), "completed": unit.get("completed", False),
               "engine_order_id": unit.get("order_id"), "visible": unit.get("visible", False)}
     result["current_activity"] = {3: "standing guard", 6: "moving", 10: "attacking a target", 14: "attack-moving", 49: "following a unit"}.get(unit.get("order_id"), "other engine order")
+    result["combat_role"] = _combat_role(unit)
     if origin is not None:
         result.update(direction=_direction(origin, unit), distance_pixels=round(_distance(origin, unit)))
     for key in ("generation", "max_hp", "shields", "ground_weapon_cooldown", "air_weapon_cooldown", "weapon_cooldown", "combat_stats", "kills"):
@@ -460,7 +579,7 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
             raise CombatStateError("A squad command references a non-combat unit.")
         if action["kind"] == CombatKind.ATTACK_TARGET.value and action.get("target") not in enemy_by_id:
             raise CombatStateError("Focus fire requires a currently visible hostile target.")
-        if action["kind"] in {CombatKind.GATHER.value, CombatKind.BUILD.value, CombatKind.TRAIN.value}:
+        if action["kind"] in {CombatKind.GATHER.value, CombatKind.BUILD.value, CombatKind.TRAIN.value, CombatKind.UPGRADE.value}:
             if len(members) != 1 or action.get("unit") != members[0]:
                 raise CombatStateError("An economic command requires one explicit actor.")
             actor = own_by_id[members[0]]
@@ -472,7 +591,11 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
                 raise CombatStateError("Unsupported producer or training target.")
             if action["kind"] == CombatKind.BUILD.value and action.get("building") not in {109, 111}:
                 raise CombatStateError("Unsupported combat construction target.")
-        if action["kind"] not in {CombatKind.CONTINUE.value, CombatKind.TRAIN.value}:
+            if action["kind"] == CombatKind.UPGRADE.value and (actor["type_id"] != 122 or actor.get("order_id") == 76
+                    or action.get("upgrade") != "infantry_weapons" or action.get("mineral_cost") != 100 or action.get("gas_cost") != 100
+                    or state.get("minerals", 0) < 100 or state.get("gas", 0) < 100 or _weapons_upgrade_ordered(history)):
+                raise CombatStateError("Unsupported or unavailable infantry weapons upgrade.")
+        if action["kind"] not in {CombatKind.CONTINUE.value, CombatKind.TRAIN.value, CombatKind.UPGRADE.value}:
             point = action.get("point")
             width, height = _bounds(state)
             if not isinstance(point, dict) or type(point.get("x")) is not int or type(point.get("y")) is not int or not (0 <= point["x"] < width and 0 <= point["y"] < height):
@@ -484,9 +607,10 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
             "name": name, "composition": dict(Counter(unit.get("type", "unit") for unit in squad)),
             "center": center, "total_hp": sum(unit["hp"] for unit in squad),
             "formation": _formation(squad),
+            "local_visible_ground_threats": _local_threats(squad, own, enemies, mission),
             "spread_pixels": round(max(_distance(unit, center) for unit in squad)),
             "members": [{key: value for key, value in _unit_summary(unit, owned=True).items()
-                         if key in {"id", "generation", "type", "hp", "position", "current_activity", "order_target"}} for unit in squad],
+                         if key in {"id", "generation", "type", "hp", "position", "current_activity", "order_target", "combat_role"}} for unit in squad],
             "current_order_counts": dict(Counter(_unit_summary(unit, owned=True)["current_activity"] for unit in squad)),
             "visible_enemies_nearest_first": [_unit_summary(unit, center, owned=False) for unit in sorted(enemies, key=lambda unit: _distance(unit, center))[:8]],
         })
@@ -498,7 +622,7 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
         action = event.get("action", event)
         if not isinstance(action, dict):
             continue
-        entry = {key: action[key] for key in ("kind", "label", "squad", "point", "target") if key in action}
+        entry = {key: action[key] for key in ("kind", "label", "squad", "point", "target", "building", "upgrade") if key in action}
         member_ids = action.get("units", event.get("units"))
         if isinstance(member_ids, list) and member_ids and all(type(uid) is int and uid >= 0 for uid in member_ids):
             entry["units"] = sorted(set(member_ids))
@@ -512,7 +636,7 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
                 entry["identity_note"] = "Legacy order lacks generations; ID-only matching applies only to current units whose generation is unknown."
         elif entry.get("kind") in tactical_kinds:
             entry["identity_note"] = "Legacy order has no member IDs; not applied to current squads by name."
-        for key in ("frame", "accepted"):
+        for key in ("frame", "accepted", "issued"):
             if key in event:
                 entry[key] = event[key]
         if "command" in event:
@@ -571,6 +695,8 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
         "game": "Original StarCraft shareware combat mission", "mission": mission.name,
         "objectives": list(mission.objectives), "observed_frame": state.get("frame"),
         "mission_playbook": list(MISSION_PLAYBOOK),
+        "combat_guidance": COMBAT_GUIDANCE,
+        "recent_battle_outcomes": recent_battle_outcomes(state, history, mission.combat_types),
         "map_pixels": {"width": _bounds(state)[0], "height": _bounds(state)[1]},
         "coordinates": "x increases east; y increases south. Map boundaries are known; unseen enemy locations are not.",
         "resources": {key: state[key] for key in ("minerals", "gas", "supply") if key in state},
@@ -580,7 +706,13 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
                     "mineral_workers": sum(worker["current_job"] == "gathering minerals" for worker in economic_workers),
                     "production": [{"id": unit["id"], "type": unit.get("type"), "completed": unit.get("completed"), "queued_unit_types": unit.get("build_queue", [])} for unit in own if unit["type_id"] in {106, 111}],
                     "available_supply": supply(state)[1] - supply(state)[0],
-                    "limits": "SCVs and Marines each cost50 minerals and1 supply. SCV cap12; Marine cap72; one queued unit per producer. Supply Depots cost100 and add8 supply; offered near supply limit with one underway. Barracks cost150; at most3 owned or underway, with only one Barracks under construction. Marines need no gas.",
+                    "infantry_weapons_order_previously_accepted": _weapons_upgrade_ordered(history),
+                    "visible_engineering_bays": [{"id": unit["id"], "completed": unit.get("completed", False),
+                                                  "upgrading_order_active": unit.get("order_id") == 76}
+                                                 for unit in own if unit["type_id"] == 122 and unit.get("visible") is True],
+                    "recent_failed_build_sites": _failed_build_sites(state, history),
+                    "failed_placement_rule": "An issued building command that failed verification suppresses only the same building type and exact point for 720 game frames. Other candidate sites remain available; this does not prove terrain is permanently invalid.",
+                    "limits": "SCVs and Marines each cost50 minerals and1 supply. SCV cap12; Marine cap72; one queued unit per producer. Supply Depots cost100 and add8 supply; offered near supply limit with one underway. Barracks cost150; at most3 owned or underway, with only one Barracks under construction. Marines need no gas. Infantry weapons level1 costs100 minerals and100 gas at a completed Engineering Bay; offered until one issued order is accepted, never while that Bay has upgrade order76. Acceptance is not proof of completed research.",
                     "menu_actor_selection": "Equivalent worker assignments use the closest available worker to visible minerals; equivalent producers use one idle compatible building. Jev chooses whether to issue that concrete command.",
                     "parallel_orders": "A worker command does not stop army orders. Production runs concurrently with army movement and fighting."},
         "squads": squad_state,
@@ -608,7 +740,7 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
         }
     questions = {"action": {
         "type": "choice",
-        "instructions": "Choose the available gameplay command that makes the most useful progress toward completing the mission from the CURRENT observed state. Compare present combat activity, health, visible targets, mineral income, production, and exploration. Continue means issue no command: judge its effect from current orders, not historical acceptance. A worker or production command can run concurrently with existing military orders. Avoid reversing a productive advance without a tactical reason. Unknown enemy locations remain unknown. All options are real gameplay actions; choose one.",
+        "instructions": "Choose the available gameplay command that makes the most useful progress toward completing the mission from the CURRENT observed state. Use combat_guidance: compare local armed threats, composition, HP and range; a coherent formation does not guarantee enough strength. Handle immediate armed defenders before durable unarmed buildings and reconsider approaches associated with recent observed losses. Compare income, production, and exploration too. Continue means issue no command: judge its effect from current orders, not historical acceptance. A worker or production command can run concurrently with existing military orders. Avoid reversing a productive advance without a tactical reason. Unknown enemy locations remain unknown. All options are real gameplay actions; choose one.",
         "criteria": {key: action["label"] for key, action in actions.items()},
     }}
     for key, action in actions.items():
@@ -622,7 +754,7 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
 
 
 _INTENT_KINDS = {
-    "Economy": {"gather", "train", "build"},
+    "Economy": {"gather", "train", "build", "upgrade"},
     "Engage": {"attack_target", "attack_move"},
     "Explore": {"explore"},
     "Reposition": {"retreat", "regroup"},
@@ -659,15 +791,15 @@ def graph_request_for(state: dict, actions: dict[str, CombatAction], history: li
     """
     model_state, flat_questions = request_for(state, actions, history, mission)
     descriptions = {
-        "Economy": "Issue a worker, production, or supply command. Existing military orders continue independently.",
-        "Engage": "Issue a squad attack against a currently visible hostile target or attack-move toward an explicitly known or last-seen objective; stale sightings remain uncertain.",
+        "Economy": "Issue a worker, production, supply, or infantry weapons upgrade command. Existing military orders continue independently; research takes time.",
+        "Engage": "Issue a squad attack against a currently visible hostile target or attack-move toward a known objective. Compare immediate armed threats with unarmed buildings; stale sightings remain uncertain.",
         "Explore": "Issue a squad attack-move to reveal terrain and look for remaining hostile forces or the rebel base. A coherent core is already assembled wherever it currently stands; maintaining replacements does not require returning that force to base.",
         "Reposition": "Move a squad to regroup or retreat; ordinary movement replaces firing or an advance. Consider formation.core_count: regrouping a coherent core is an optional reposition or withdrawal, not unfinished assembly. Small reinforcements and threatened forces can still benefit.",
         "Continue": "Issue no new command; preserve only the currently observed activities.",
     }
     questions = {"intent": {
         "type": "choice",
-        "instructions": "Choose which kind of gameplay command would make the most useful progress toward completing the mission from the CURRENT observed state. Use the mission_playbook: establish income and maintain Marine production. Check each squad's formation, not its name or the total scattered army. At least 8 combat units in a measured 192px core means that force is already assembled there; it can sustain a supported advance while replacements are produced or smaller groups regroup. A distant reinforcement does not require reversing the formed force. After losses, rebuild; visible threats and health can justify retreat even for a formed force. Explore and revisit known objectives while sustaining replacements. Compare each category's best available command, regardless of option count. Continue starts no new activity; production and commands to other squads preserve an existing advance. Select a category; independent companion questions recommend its concrete commands.",
+        "instructions": "Choose which kind of gameplay command would make the most useful progress toward completing the mission from the CURRENT observed state. Use mission_playbook and combat_guidance: establish income, maintain Marine production, and compare local armed defenders, HP, composition, range and recent_battle_outcomes before committing a force. Handle immediate armed threats before durable unarmed buildings; Marines should preserve range against Firebat splash. Check each squad's formation, not its name or total scattered army. At least 8 combat units in a measured 192px core means already assembled, not sufficient strength against the observed defense. When strength permits, preserve its advance while replacements are produced or smaller groups regroup. A distant reinforcement does not require reversing it. After costly observed losses, reconsider the approach, rebuild or reinforce; current danger can justify retreat. Compare each category's best available command regardless of option count. Continue starts no new activity; production and commands to other squads preserve an existing advance. Select a category; independent companion questions recommend its concrete commands.",
         "criteria": {},
     }}
     routing = graph_routing(actions)
@@ -681,7 +813,7 @@ def graph_request_for(state: dict, actions: dict[str, CombatAction], history: li
         if question_id is not None:
             questions[question_id] = {
                 "type": "choice",
-                "instructions": f"Assuming a {category.lower()} command is to be issued, choose the available concrete command that best advances the mission from the current observations and mission_playbook. Maintain income and production. A measured core of at least 8 combat units is already assembled at its present location; a return to base is a withdrawal, not required assembly. After losses, rebuild and gather small reinforcements; health and visible danger can justify retreat. This is an independent recommendation, used only if the separate intent decision selects {category}. Compare actual members, formation, targets, health, current orders, resources, and observed positions. Preserve a productive supported advance unless there is a tactical reason to replace it; production and commands to other squads run concurrently. Last-seen structures may be revisited but their continued presence is uncertain; never-observed locations remain unknown. Choose one actual gameplay command.",
+                "instructions": f"Assuming a {category.lower()} command is to be issued, choose the available concrete command that best advances the mission from current observations, mission_playbook and combat_guidance. Compare local armed threats and range before durable unarmed buildings; avoid close-range Firebat splash and repeating approaches associated with recent observed losses at comparable strength. Maintain income and production. A measured core of at least 8 is already assembled but is not automatically strong enough for the defense. A return to base is a withdrawal, not required assembly. After losses, reinforce; health and visible danger can justify retreat. This is an independent recommendation, used only if the separate intent decision selects {category}. Compare actual members, formation, targets, health, current orders, resources, and observed positions. Preserve a productive supported advance unless there is a tactical reason to replace it; other-squad commands and production run concurrently. Last-seen structures remain uncertain and never-observed locations unknown. Choose one actual gameplay command.",
                 "criteria": {key: flat_criteria[key] for key in candidate_ids},
             }
     return model_state, questions, routing

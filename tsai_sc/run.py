@@ -9,7 +9,7 @@ from pathlib import Path
 import time
 
 from .controller import InputAdapter, candidates, request_for, verify_command
-from . import combat
+from . import battle, combat
 from .engine import BottleShipBridge
 from .game import GameStateError, read_state
 from .typesafe import TypeSafeClient, TypeSafeError
@@ -201,6 +201,9 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
                     decisions.write(json.dumps(event, separators=(',', ':')) + '\n')
                     decisions.flush()
                     history.append({'command': selected['label'], 'kind': selected['kind'], 'squad': selected.get('squad'), 'point': selected.get('point'),
+                                    'building': selected.get('building'), 'upgrade': selected.get('upgrade'),
+                                    'issued': issued.get('issued') is True,
+                                    'combat_snapshot': battle.history_snapshot(state, combat.STRONGARM.combat_types) if is_combat else {},
                                     'units': executed.get('units', [executed['unit']] if 'unit' in executed else []),
                                     'unit_generations': {str(unit['id']): unit['generation'] for unit in state['units']
                                                          if unit['id'] in executed.get('units', []) and 'generation' in unit},

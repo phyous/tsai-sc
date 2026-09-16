@@ -25,8 +25,8 @@ The original 96×64-tile map contains enemy forces, combat encounters, and scrip
 reinforcements. The player begins with eight Marines, four SCVs, two Barracks,
 a Command Center, four Supply Depots, a Refinery, and an Engineering Bay.
 
-Jev directs combat squads, exploration, mineral gathering, and reinforcement
-production. Enemy locations enter its observations only when visible to the
+Jev directs combat squads, exploration, mineral gathering, reinforcement
+production, and an infantry weapons upgrade. Enemy locations enter its observations only when visible to the
 player. The original executable runs the opposing forces and mission triggers.
 Success requires its committed victory outcome **and a captured, visually checked
 original victory dialog**. The recorder continues after the outcome changes so
@@ -119,18 +119,23 @@ eight to twelve Marines together before an unsupported push, rebuild after
 losses, and explore for remaining enemies. A measured core of at least eight
 combat units within 192 pixels of one member explicitly marks assembly complete;
 the prompt distinguishes reinforcing small groups from withdrawing a formed
-force, and allows pathfinding detours. These instructions
+force, and allows pathfinding detours. It also reports nearby visible defenders'
+composition, HP, and known base ranges, distinguishing armed units, attack-capable
+workers, and unarmed buildings. Guidance addresses immediate defenders and
+short-range Firebat splash; formation size alone does not establish sufficient
+strength. These observations do not predict combat outcomes. The instructions
 contain no enemy-base coordinates or predetermined mission route.
 
 | Model choice | Candidate supplied by the harness | Original game controls |
 | --- | --- | --- |
 | Focus fire | A currently visible hostile unit or building | Select squad, `A`, click target |
-| Attack toward enemies | A visible enemy group's position or a previously seen structure location | Select squad, `A`, click ground |
-| Explore | A bounded north/east/south/west advance from the squad | Select squad, `A`, click ground |
+| Attack toward enemies | A visible enemy group's position or a previously seen structure location | Select squad, `A`, click destination on minimap |
+| Explore | A bounded north/east/south/west advance from the squad | Select squad, `A`, click destination on minimap |
 | Retreat or regroup | A point away from a visible threat, an observed friendly base for assembling replacements, or the friendly force's center | Select squad, `M`, click ground |
 | Gather minerals | An available SCV and an observed mineral field | Select SCV, right-click minerals |
 | Train Marine or SCV | An idle compatible producer with sufficient minerals and supply | Select Barracks or Command Center, `M` or `S` |
 | Build Supply Depot or Barracks | An available SCV and an open candidate site near the friendly base | Select SCV, `B`, then `S` or `B`, click placement |
+| Upgrade infantry weapons | A completed Engineering Bay and 100 minerals / 100 gas | Select Engineering Bay, `W`; research takes time |
 | Continue current orders | Keep persistent orders in progress | No new input |
 
 The deterministic adapter groups nearby selectable combat units into squads of
@@ -140,7 +145,10 @@ camera, and requires the full surviving selectable squad to be selected before
 issuing its order. Mouse clicks are queued against paused position snapshots;
 each click's resulting selection is checked. It supplies up to eight
 squads, four nearest visible focus targets per squad, known costs, prerequisites,
-and tile-aligned construction candidates. Exploration geometry uses the squad's
+and tile-aligned construction candidates. Economy commands likewise require the
+exact requested actor after a paused 1 ms selection tap. Ground attack orders
+use the minimap to avoid turning a ground destination into a click on a building
+sprite; focus fire still clicks a visible target. Exploration geometry uses the squad's
 observed position and map bounds; the game determines terrain passability.
 Recent observed friendly positions help Jev track where it has already moved.
 The harness also remembers up to thirty-two enemy structures actually seen in
@@ -149,11 +157,23 @@ attack-move destinations. Stale sightings are explicitly uncertain, and focus
 fire still requires current visibility. Movement history distinguishes new
 units from dead units whose slots the original game reuses.
 
+Compact battle memory retains up to four recent encounters where owned combat
+identities disappeared near then-visible hostiles. It records observed losses
+and a previously observed defender composition, with workers counted separately.
+Disappearance does not establish its cause, and past sightings do not establish
+current enemy positions or strength. This feedback lets Jev reconsider an
+approach without receiving hidden map knowledge.
+
 Economy options cap the offered workforce at twelve SCVs and the Marine force
 at seventy-two, with one queued unit per producer. Depots are offered near the
 supply limit, with one unfinished depot at a time.
 Barracks can be rebuilt or expanded to three, with one under construction at a
-time, for the original cost of 150 minerals each. Workers inside refineries,
+time, for the original cost of 150 minerals each. Placement search covers a
+bounded area in every direction around the observed base, avoiding observed
+obstacles and temporarily excluding recently rejected sites. The game validates
+terrain. Infantry weapons level 1 costs 100 minerals and 100 gas; after one
+issued upgrade order is accepted, it is no longer offered during that run.
+Acceptance confirms research started, not that it finished. Workers inside refineries,
 unfinished units, and workers already constructing cannot be retasked through
 these options. This action-space design is part of the experiment: Jev selects
 a category and its supplied command, and the adapter translates that selection into input.

@@ -181,13 +181,38 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             building_sites(state, 110)
 
+    def test_building_sites_search_north_and_are_bounded_near_own_base(self):
+        state = mission()
+        cc = state['units'][1]
+        for type_id in (109, 111):
+            points = building_sites(state, type_id)
+            self.assertLessEqual(len(points), 12)
+            self.assertEqual(len(points), len({(p['x'], p['y']) for p in points}))
+            self.assertTrue(any(p['y'] < cc['y'] - 100 for p in points))
+            self.assertTrue(any(p['y'] > cc['y'] + 100 for p in points))
+            for p in points:
+                self.assertLessEqual(abs(p['x'] - cc['x']), 367)
+                self.assertLessEqual(abs(p['y'] - cc['y']), 367)
+
+    def test_building_sites_fall_back_to_outer_ring_when_inner_ring_is_occupied(self):
+        state = mission()
+        state['units'] = [unit(2, 106, 800, 800)]
+        inner = building_sites(state, 111)
+        self.assertEqual(len(inner), 12)
+        state['units'].extend(unit(100 + i, 111, **p) for i, p in enumerate(inner))
+        outer = building_sites(state, 111)
+        self.assertTrue(outer)
+        self.assertFalse(any(p in inner for p in outer))
+        self.assertTrue(all(max(abs(p['x'] - 800), abs(p['y'] - 800)) >= 192 for p in outer))
+
     def adapter(self, bridge):
         adapter = InputAdapter(bridge)
         adapter._settle = lambda *args: None
         return adapter
 
     def execute(self, adapter, state, action, fresh=None):
-        with patch('tsai_sc.controller.read_state', return_value=fresh or state) as read:
+        with patch('tsai_sc.controller.read_state', return_value=fresh or state) as read, \
+                patch('tsai_sc.controller.read_selection', return_value=[action['unit']]):
             result = adapter.execute(state, action)
         self.assertEqual(read.call_count, 1)
         return result
@@ -263,13 +288,13 @@ class ControllerTests(unittest.TestCase):
         fresh = copy.deepcopy(state)
         fresh['units'][0].update(x=420, y=510)
         self.execute(adapter, state, candidates(state)['mine_1'], fresh)
-        self.assertIn(('clickHold', 420, 126, 100, 0), bridge.calls)
-        self.assertNotIn(('clickHold', 400, 116, 100, 0), bridge.calls)
+        self.assertIn(('clickHold', 420, 126, 1, 0), bridge.calls)
+        self.assertNotIn(('clickHold', 400, 116, 1, 0), bridge.calls)
         self.assertIn(('clickHold', False), bridge.input_running)
         # With the actor already visible there must be no game input before its
         # fresh selection. Escape used to cancel the previously selected unit.
         self.assertEqual(bridge.calls[:3], [
-            ('resume',), ('pause',), ('clickHold', 420, 126, 100, 0),
+            ('resume',), ('pause',), ('clickHold', 420, 126, 1, 0),
         ])
 
     def test_new_commands_never_send_escape_or_blanket_reset_keys(self):
@@ -359,6 +384,26 @@ class ControllerTests(unittest.TestCase):
             self.execute(self.adapter(bridge), mission(), {'kind': 'train', 'unit': 2})
         self.assertFalse(any(call[0] == 'keyHold' for call in bridge.calls))
         self.assertFalse(bridge.running)
+
+    def test_wrong_economic_actor_blocks_commands_and_records_actual_selection(self):
+        for selected in ([], [2], [1, 2]):
+            bridge = Bridge()
+            state = mission()
+            state['units'][0].update(x=400, y=500)
+            action = {'kind': 'build', 'unit': 1, 'building': 111,
+                      'point': {'x': 320, 'y': 592}}
+            def actual_selection(_):
+                self.assertFalse(bridge.running)
+                return selected
+            with patch('tsai_sc.controller.read_state', return_value=state), \
+                    patch('tsai_sc.controller.read_selection', side_effect=actual_selection):
+                result = self.adapter(bridge).execute(state, action)
+            self.assertFalse(result['issued'])
+            self.assertEqual(result['selected_units'], selected)
+            self.assertFalse(any(call[0] == 'keyHold' for call in bridge.calls))
+            self.assertEqual([call for call in bridge.calls if call[0] == 'clickHold'],
+                             [('clickHold', 400, 116, 1, 0)])
+            self.assertFalse(bridge.running)
 
 
 class CommandFeedbackTests(unittest.TestCase):
@@ -508,6 +553,8 @@ class TacticalControllerTests(unittest.TestCase):
         adapter._settle = lambda *args: None
         reader = {'side_effect': itertools.chain(snapshots, itertools.repeat(snapshots[-1]))} if snapshots is not None else {'return_value': state}
         def observed_selection(_):
+            if 'units' not in action:
+                return [action['unit']]
             clicks = [call for call in bridge.calls if call[0] == 'clickHold' and call[2] < 348]
             if not clicks:
                 return []
@@ -526,7 +573,8 @@ class TacticalControllerTests(unittest.TestCase):
         up = ('key', 'shift', {'up': True})
         self.assertIn(up, bridge.calls)
         self.assertLess(bridge.calls.index(up), bridge.calls.index(('keyHold', 'a', 60)))
-        self.assertIn(('clickHold', 500, 176, 100, 0), bridge.calls)
+        self.assertIn(('clickHold', 38, 398, 100, 0), bridge.calls)
+        self.assertEqual(result['destination_input'], 'minimap')
         self.assertEqual(bridge.calls[-2:], [up, ('pause',)])
         self.assertFalse(bridge.running)
         self.assertFalse(any(call[0] == 'keyHold' and call[1] == 'escape' for call in bridge.calls))
@@ -550,7 +598,7 @@ class TacticalControllerTests(unittest.TestCase):
         self.assertEqual(result['selection_method'], 'already_selected')
         self.assertEqual(fresh.call_count, 1)
         # Only the requested order's destination is clicked, not each Marine.
-        self.assertEqual([call for call in bridge.calls if call[0] == 'clickHold'], [('clickHold', 500, 176, 100, 0)])
+        self.assertEqual([call for call in bridge.calls if call[0] == 'clickHold'], [('clickHold', 38, 398, 100, 0)])
         self.assertNotIn(('key', 'shift', {'down': True}), bridge.calls)
         self.assertEqual(result['inputs'][-1], {'command': 'key', 'args': ['shift', {'up': True}]})
 
@@ -705,6 +753,32 @@ class TacticalControllerTests(unittest.TestCase):
         # Actual 96x64 minimap rectangle x22..118,y380..444, world/32.
         self.assertEqual(bridge.calls, [('clickHold', 72, 412, 100, 0)])
 
+    def test_minimap_ground_attack_does_not_focus_or_click_destination_building_sprite(self):
+        state = self.state()
+        # The destination is occupied by a friendly building and remains
+        # off-camera. Ground attack must not pan then A-click that sprite.
+        state['units'][3].update(x=2000, y=1500)
+        for kind in ('attack_move', 'explore'):
+            action = self.action(kind)
+            action['point'] = {'x': 2000, 'y': 1500}
+            result, bridge = self.execute(state, action)
+            self.assertTrue(result['issued'])
+            self.assertIn(('clickHold', 84, 427, 100, 0), bridge.calls)
+            self.assertEqual(sum(call[0] == 'clickHold' and call[2] >= 348 for call in bridge.calls), 1)
+            self.assertLess(bridge.calls.index(('keyHold', 'a', 60)),
+                            bridge.calls.index(('clickHold', 84, 427, 100, 0)))
+
+    def test_minimap_coordinates_clamp_rounding_to_inside_map_edges(self):
+        adapter = InputAdapter(Bridge())
+        adapter.map_size = (96, 64)
+        self.assertEqual(adapter.minimap_point(0, 0), {'x': 22, 'y': 380})
+        self.assertEqual(adapter.minimap_point(3071, 2047), {'x': 117, 'y': 443})
+        adapter.map_size = (64, 64)
+        self.assertEqual(adapter.minimap_point(2047, 2047), {'x': 133, 'y': 475})
+        for point in [(-1, 20), (2048, 20), (20, float('nan'))]:
+            with self.assertRaisesRegex(RuntimeError, 'outside'):
+                adapter.minimap_point(*point)
+
     def test_marine_training_uses_barracks_hotkey_and_verifies_marine_queue(self):
         state = self.state()
         action = {'kind': 'train', 'unit': 4, 'train_type': 0}
@@ -716,6 +790,26 @@ class TacticalControllerTests(unittest.TestCase):
         self.assertFalse(verify_command(state, after, action)['accepted'])
         after['units'][3]['build_queue'] = [0]
         self.assertTrue(verify_command(state, after, action)['accepted'])
+
+    def test_infantry_weapons_uses_verified_engineering_bay_and_w(self):
+        state = self.state()
+        state['gas'] = 200
+        state['units'][3].update(type_id=122, order_id=23)
+        action = {'kind': 'upgrade', 'unit': 4, 'upgrade': 'infantry_weapons'}
+        result, bridge = self.execute(state, action)
+        self.assertTrue(result['issued'])
+        self.assertEqual(result['selected_units'], [4])
+        self.assertEqual([call for call in bridge.calls if call[0] == 'keyHold'], [('keyHold', 'w', 60)])
+        after = copy.deepcopy(state)
+        after['units'][3]['order_id'] = 76
+        after['gas'] = 100
+        after['minerals'] += 8  # Concurrent mining need not produce an exact mineral delta.
+        self.assertTrue(verify_command(state, after, action)['accepted'])
+        after['gas'] = 200
+        self.assertFalse(verify_command(state, after, action)['accepted'])
+        after['gas'] = 100
+        state['units'][3]['order_id'] = 76
+        self.assertFalse(verify_command(state, after, action)['accepted'])
 
     def test_retreat_requires_move_order_to_requested_destination(self):
         state = self.state()

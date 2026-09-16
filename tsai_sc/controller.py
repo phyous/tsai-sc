@@ -106,6 +106,11 @@ def verify_command(before, after, action):
     if kind == 'train':
         trained = action.get('train_type', 7)
         accepted = trained in unit['build_queue'] or len(own_units(after, trained)) > len(own_units(before, trained))
+    elif kind == 'upgrade':
+        previous = next((u for u in before['units'] if u['id'] == action['unit']), None)
+        accepted = (action.get('upgrade') == 'infantry_weapons' and unit['type_id'] == 122
+                    and previous is not None and previous['order_id'] != 76 and unit['order_id'] == 76
+                    and before['gas'] - after['gas'] >= 100)
     elif kind == 'build':
         started = any(math.dist((u['x'], u['y']), (action['point']['x'], action['point']['y'])) < 24 for u in own_units(after, action['building']))
         accepted = started or unit['order_id'] in {30, 33}
@@ -133,7 +138,19 @@ def building_sites(state, building_id):
         return []
     cc = centers[0]
     result = []
-    for dx, dy in [(176, 96), (304, 96), (176, 192), (304, 192), (-176, 160), (48, 224)]:
+    # Search the observed base in every direction. A fixed southern strip can
+    # repeatedly offer unbuildable terrain while open northern ground exists.
+    # Four bounded rings are geometry only; the game still validates terrain.
+    directions = [(0, -1), (1, 0), (0, 1), (-1, 0),
+                  (1, -1), (1, 1), (-1, 1), (-1, -1)]
+    # Intermediate spokes find gaps between existing structures; eight compass
+    # points alone miss the open ground between the northern starting buildings.
+    for fraction in (.25, .5, .75):
+        directions.extend([(fraction, -1), (-fraction, -1), (1, fraction), (1, -fraction),
+                           (fraction, 1), (-fraction, 1), (-1, fraction), (-1, -fraction)])
+    offsets = [(int(dx * radius), int(dy * radius)) for radius in (128, 192, 256, 320)
+               for dx, dy in directions]
+    for dx, dy in offsets:
         x = ((cc['x'] + dx) // 32) * 32 + (width // 2) % 32
         y = ((cc['y'] + dy) // 32) * 32 + (height // 2) % 32
         margin_x, margin_y = max(64, width // 2 + 8), max(64, height // 2 + 8)
@@ -149,8 +166,10 @@ def building_sites(state, building_id):
             if abs(unit['x'] - x) < (w + width) / 2 + 8 and abs(unit['y'] - y) < (h + height) / 2 + 8:
                 blocked = True
                 break
-        if not blocked:
+        if not blocked and {'x': x, 'y': y} not in result:
             result.append({'x': x, 'y': y})
+            if len(result) == 12:
+                break
     return result
 
 
@@ -270,18 +289,27 @@ class InputAdapter:
         x, y = struct.unpack('<II', self.bridge.read_memory(CAMERA, 8))
         return {'x': x, 'y': y}
 
+    def minimap_point(self, x, y):
+        """Translate a world destination to the original bounded minimap."""
+        w, h = self.map_size
+        if (not all(isinstance(value, (int, float)) and math.isfinite(value) for value in (x, y))
+                or not (0 <= x < w * 32 and 0 <= y < h * 32)):
+            raise CommandUnavailable('Destination is outside the playable map')
+        # Original zoom:64×64 uses2px/tile;96×64 uses1px/tile. The
+        # rectangular map is centered in the128×128 panel at(6,348).
+        pixels_per_tile = 2 ** math.floor(math.log2(128 / max(w, h)))
+        scale = 32 / pixels_per_tile
+        left, top = 6 + (128 - w * pixels_per_tile) / 2, 348 + (128 - h * pixels_per_tile) / 2
+        return {'x': max(math.ceil(left), min(round(left + x / scale), math.ceil(left + w * pixels_per_tile) - 1)),
+                'y': max(math.ceil(top), min(round(top + y / scale), math.ceil(top + h * pixels_per_tile) - 1))}
+
     def focus(self, x, y, *, margin_x=24, margin_y=28):
         point = game_to_screen(x, y, self.camera(), height=312)
         if point and margin_x <= point['x'] <= 639 - margin_x and margin_y <= point['y'] <= 311 - margin_y:
             return point
-        # Original minimap zoom is a power of two:64x64 uses2px/tile,
-        # Strongarm's96x64 uses1px/tile, centered in the128px panel.
-        w, h = self.map_size
-        pixels_per_tile = 2 ** math.floor(math.log2(128 / max(w, h)))
-        scale = 32 / pixels_per_tile
+        minimap = self.minimap_point(x, y)
         for _ in range(2):
-            self._input('clickHold', round(6 + (128 - w * 32 / scale) / 2 + x / scale),
-                        round(348 + (128 - h * 32 / scale) / 2 + y / scale), 100, 0)
+            self._input('clickHold', minimap['x'], minimap['y'], 100, 0)
             point = game_to_screen(x, y, self.camera(), height=312)
             if point is not None:
                 return point
@@ -392,11 +420,16 @@ class InputAdapter:
                 target = {'x': enemy['x'], 'y': enemy['y']}
             else:
                 return {'issued': False, 'inputs': list(self.inputs), 'reason': 'Focus target is no longer visible', 'selected_units': actual}
-        point = self.focus(**target)
+        # Ground attack commands use the minimap, which avoids hitting a
+        # building sprite at the world destination. Explicit focus fire still
+        # clicks the refreshed visible target in the main game viewport.
+        ground_attack = action['kind'] in {'attack_move', 'explore'}
+        point = self.minimap_point(**target) if ground_attack else self.focus(**target)
         self._input('keyHold', 'a' if action['kind'] in {'attack_move', 'attack_target', 'explore'} else 'm', 60)
         self._input('clickHold', point['x'], point['y'], 100, 0)
         self._input('move', 320, 280)
-        return {'issued': True, 'inputs': list(self.inputs), **selection}
+        return {'issued': True, 'inputs': list(self.inputs),
+                'destination_input': 'minimap' if ground_attack else 'viewport', **selection}
 
     def execute(self, state, action):
         try:
@@ -442,14 +475,26 @@ class InputAdapter:
             point = game_to_screen(actor['x'], actor['y'], fresh['camera'], height=312)
             if point is None:
                 return {'issued': False, 'inputs': list(self.inputs), 'reason': 'Actor left the viewport'}
-            self.inputs.append({'command': 'clickHold', 'args': [point['x'], point['y'], 100, 0]})
-            selection = self.bridge.rpc('clickHold', point['x'], point['y'], 100, 0)
+            # As with Marines, a100ms hold can select a neighboring moving SCV
+            # after the intended actor walks away before mouse-up.
+            self.inputs.append({'command': 'clickHold', 'args': [point['x'], point['y'], 1, 0]})
+            selection = self.bridge.rpc('clickHold', point['x'], point['y'], 1, 0)
             if isinstance(selection, dict) and selection.get('ok') is False:
                 raise RuntimeError('Original game unit selection was rejected by the runtime')
             self.bridge.resume()
             self._settle()
+            self.bridge.pause()
+            selected = read_selection(self.bridge.read_memory)
+            if selected != [actor['id']]:
+                return {'issued': False, 'inputs': list(self.inputs), 'selected_units': selected,
+                        'reason': 'Could not select the exact requested actor'}
+            self.bridge.resume()
             if action['kind'] == 'train':
                 self._input('keyHold', {7: 's', 0: 'm', 32: 'f'}[action.get('train_type', 7)], 60)
+            elif action['kind'] == 'upgrade':
+                if action.get('upgrade') != 'infantry_weapons' or actor['type_id'] != 122:
+                    raise ValueError('Only Engineering Bay infantry weapons is supported')
+                self._input('keyHold', 'w', 60)
             elif action['kind'] == 'gather':
                 target = units[action['target']]
                 point = self.focus(target['x'], target['y'])
@@ -469,6 +514,6 @@ class InputAdapter:
             else:
                 raise ValueError('Unsupported action')
             self._input('move', 320, 280)  # Do not leave the pointer on a scroll edge.
-            return {'issued': True, 'inputs': list(self.inputs)}
+            return {'issued': True, 'inputs': list(self.inputs), 'selected_units': selected}
         finally:
             self.bridge.pause()
