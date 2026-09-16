@@ -157,6 +157,7 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
     model_calls = 0
     final = None
     last_observed_frame = None
+    stalled_running_seconds = 0.0
     next_lane = 'economy'
     unchanged_frame_expected = False
     write_json(recorder.directory / 'manifest.json', {
@@ -208,18 +209,27 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
                     break
                 stopped_clock = state['frame'] == last_observed_frame and not unchanged_frame_expected
                 unchanged_frame_expected = False
+                if state['frame'] != last_observed_frame or state.get('game_paused'):
+                    stalled_running_seconds = 0.0
                 last_observed_frame = state['frame']
                 if state.get('game_paused') or stopped_clock:
                     # Original campaign transmissions can pause simulation and
                     # force the camera. Wait for gameplay to resume, recording
                     # the original presentation without issuing tactical input.
-                    recorder.action = {'label': 'Original game pause — waiting for mission transmission to finish'}
+                    if stalled_running_seconds >= 60:
+                        raise RuntimeError('Original game clock remained stopped after 60 seconds of resumed execution; inspect the runtime for a blocking dialog or failure')
+                    recorder.action = {'label': ('Original game pause — waiting for mission transmission to finish'
+                                                if state.get('game_paused') else
+                                                'Game clock stopped — waiting for simulation progress')}
                     bridge.resume()
-                    deadline = time.monotonic() + decision_seconds
+                    wait_started = time.monotonic()
+                    deadline = wait_started + decision_seconds
                     while time.monotonic() < deadline:
                         recorder.frame()
                         time.sleep(.04)
                     bridge.pause()
+                    if not state.get('game_paused'):
+                        stalled_running_seconds += time.monotonic() - wait_started
                     continue
                 is_combat = state.get('mission_kind') == 'combat'
                 lane = next_lane if is_combat and separate_economy else None
