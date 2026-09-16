@@ -103,11 +103,17 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
         'model_requested': 'jev-latest', 'initial_state': initial,
         'pacing': 'Game paused for consistent memory snapshots and model inference; ordinary game input between snapshots.',
         'observation': 'Read-only own/visible unit state, resources and original mission outcome',
+        'capture': 'Original 640x480 DirectDraw CPU pixels and attached palette; PNG encoding without GPU readback',
         'controller': 'Jev selects a command category and its action in parallel Choice questions; deterministic graph routing and mouse/keyboard adapter',
         'max_requests': max_requests, 'max_seconds': max_seconds, 'capture_fps': capture_fps,
         'decision_seconds': decision_seconds,
         'source_sha256': {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                           for path in sorted(Path(__file__).parent.glob('*.py'))},
+        'runtime_source_sha256': {
+            path.relative_to(Path(__file__).parent.parent).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for pattern in ('engine/*.ts', 'engine/patches/*.patch', 'scripts/*-runtime.sh')
+            for path in sorted(Path(__file__).parent.parent.glob(pattern))
+        },
     })
     try:
         recorder.frame(force=True)

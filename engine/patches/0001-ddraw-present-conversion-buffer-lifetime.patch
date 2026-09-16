@@ -1,0 +1,103 @@
+diff --git a/src/worker/backends/webgpu/ddraw/ddraw-backend-executor.ts b/src/worker/backends/webgpu/ddraw/ddraw-backend-executor.ts
+index 7b8eb36..5647ed7 100644
+--- a/src/worker/backends/webgpu/ddraw/ddraw-backend-executor.ts
++++ b/src/worker/backends/webgpu/ddraw/ddraw-backend-executor.ts
+@@ -3267,6 +3267,13 @@ export class DDrawWebGPUExecutor {
+ 
+     endFrameForPresent(): void {
+         this.flush();
++        // Palette8 presentation submits its own conversion encoder before this
++        // call. In a pure DDraw frame currentEncoder can be null, so flush()
++        // never enters its submit/cleanup branch. Reclaim those conversion
++        // buffers here too, after flush has submitted any executor-owned work.
++        // WebGPU destroy() after submit is valid: queued uses retain the backing
++        // allocation until complete; the buffer must not be submitted again.
++        this.textureConverter.destroyPendingAfterSubmit();
+ 
+         if (!this.frameEndedThisFrame) {
+             // No EndScene was called (pure DDraw game) — rotate ring buffer
+diff --git a/tools/tests/ddraw-present-buffer-lifetime.test.ts b/tools/tests/ddraw-present-buffer-lifetime.test.ts
+new file mode 100644
+index 0000000..7114d83
+--- /dev/null
++++ b/tools/tests/ddraw-present-buffer-lifetime.test.ts
+@@ -0,0 +1,79 @@
++/** Pure DDraw palette uploads must release per-frame GPU allocations after submit. */
++import { describe, expect, test } from "bun:test";
++// Prime the worker's DirectDraw import cycle without creating a system or GPU.
++import "../../src/worker/modules/ddraw/d3d/types";
++import { DDrawWebGPUExecutor } from "../../src/worker/backends/webgpu/ddraw/ddraw-backend-executor";
++import { TextureConverter } from "../../src/worker/backends/webgpu/ddraw/compute/texture-converter";
++
++function fixture(withExecutorEncoder = false) {
++    const events: string[] = [];
++    const pending: any[] = [];
++    const converter: any = Object.create(TextureConverter.prototype);
++    converter.pendingDestroyBuffers = pending;
++    const executor: any = Object.create(DDrawWebGPUExecutor.prototype);
++    Object.assign(executor, {
++        renderStats: { flushes: 0 },
++        flushBatch() {},
++        ringBufferManager: { flushUniforms() {}, flushLights() {}, flushStorageBuffer() {}, nextFrame() {} },
++        surfacesNeedingClear: new Set(),
++        currentRenderPass: null,
++        currentEncoder: withExecutorEncoder ? { finish: () => "executor commands" } : null,
++        queue: { submit() { events.push("submit executor"); } },
++        depthManager: { flushGarbage() {}, resetFrameDirtyFlags() {} },
++        msaaColorManager: { flushGarbage() {} },
++        textureConverter: converter,
++        vertexConverter: { destroyPendingAfterSubmit() {}, startFrame() {} },
++        frameEndedThisFrame: false,
++        resetBindFastPath() {}, sampleFrameStats() {}, applyMsaaAtFrameBoundary() {},
++    });
++    function allocate(label: string, size: number) {
++        const buffer = { size, destroyed: false, destroy() {
++            expect(this.destroyed).toBe(false);
++            this.destroyed = true;
++            events.push("destroy " + label);
++        } };
++        pending.push(buffer);
++        return buffer;
++    }
++    return { executor, pending, events, allocate };
++}
++
++describe("DDraw present conversion buffer lifetime", () => {
++    test("pure 2D presents reclaim all four Palette8 buffers every frame", () => {
++        const f = fixture();
++        for (let frame = 0; frame < 100; frame++) {
++            // The presenter's independent conversion encoder has already been submitted.
++            const buffers = [f.allocate("pixels", 640 * 480 + 8), f.allocate("params", 48),
++                f.allocate("rgba", 640 * 480 * 4), f.allocate("palette", 1024)];
++            f.events.push("submit palette");
++            f.executor.endFrameForPresent();
++            expect(f.pending).toHaveLength(0);
++            expect(buffers.every(buffer => buffer.destroyed)).toBe(true);
++        }
++        expect(f.events.filter(event => event.startsWith("destroy"))).toHaveLength(400);
++        expect(f.events.includes("submit executor")).toBe(false);
++    });
++
++    test("mixed frames submit executor work before shared pending buffers are destroyed", () => {
++        const f = fixture(true);
++        f.allocate("palette", 1024);
++        f.allocate("executor upload", 8192);
++        f.events.push("submit palette");
++        f.executor.endFrameForPresent();
++        expect(f.events).toEqual(["submit palette", "submit executor", "destroy palette", "destroy executor upload"]);
++        expect(f.pending).toHaveLength(0);
++        expect(f.executor.currentEncoder).toBeNull();
++        // Repeated empty frame cleanup is harmless, with no second destroy.
++        f.executor.endFrameForPresent();
++        expect(f.events).toHaveLength(4);
++    });
++
++    test("a failed executor submit does not destroy buffers still attached to its encoder", () => {
++        const f = fixture(true);
++        const buffer = f.allocate("unsubmitted", 8192);
++        f.executor.queue.submit = () => { throw new Error("submit failed"); };
++        expect(() => f.executor.endFrameForPresent()).toThrow("submit failed");
++        expect(buffer.destroyed).toBe(false);
++        expect(f.pending).toHaveLength(1);
++    });
++});

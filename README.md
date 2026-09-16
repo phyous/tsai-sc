@@ -190,9 +190,11 @@ is presented as a visible victory.
 The video shows **action probabilities**, not estimated chances of winning. It
 labels playback speed and decision pauses. Model probabilities are preserved
 unchanged. Frames contain only the 640×480 game canvas, with an independently
-rendered dashboard. No desktop, login screen, microphone, or API key is recorded. The recorder rejects
-a blank first gameplay frame and stops on sustained black captures, such as a
-lost browser GPU device.
+rendered dashboard. Capture reads the original DirectDraw CPU pixels and palette,
+so recording does not depend on GPU readback. The pinned runtime also receives a
+temporary GPU upload-buffer cleanup patch. No desktop, login screen, microphone,
+or API key is recorded. The recorder rejects a blank first gameplay frame and
+stops on sustained black captures.
 
 Observed API compatibility issue: some large Choice replies from `jev-1.13.0`
 return every option but round values to whole percentage points totaling 99%.

@@ -1,6 +1,6 @@
 # Lessons from developing the harness
 
-These notes describe failed Strongarm attempts through attempt 10 and subsequent
+These notes describe failed Strongarm attempts through attempt 11 and subsequent
 changes and probes. They do not establish a combat victory or a measured improvement in
 win rate. Code checks, controlled game tests, and strategy hypotheses provide
 different kinds of evidence.
@@ -149,3 +149,28 @@ different kinds of evidence.
     itself is not proof of physical movement. See the
     [BWAPI order enumeration](https://github.com/bwapi/bwapi/blob/main/bwapi/include/BWAPI/Order.h)
     and [OpenBW's Follow implementation](https://github.com/OpenBW/openbw/blob/master/bwgame.h).
+
+11. **The capture guard caught a recurring GPU failure.** Attempt 11 aborted
+    after 30 model decisions when the recorded game canvas became persistently
+    black. The original game continued running, but its Chrome GPU process had
+    exited. The capture guard correctly stopped the unusable recording rather
+    than allowing further inference without gameplay evidence.
+
+    macOS kernel logs confirmed that both the attempt 07 and attempt 11 GPU
+    exits were memory-pressure kills following a “no paging space” event.
+    The browser parent and game renderer survived; runtime launch scripts and
+    RPC timeouts did not cause these process exits. Source review then found
+    a concrete allocation leak: palette presentation allocated four temporary
+    buffers, totaling 1,537,080 bytes per 640×480 conversion, but pure DirectDraw
+    frames could skip their cleanup. The [runtime patch](../engine/patches/)
+    drains those buffers after all frame encoders have been submitted. Its
+    three lifetime tests pass; this does not prove there are no other leaks.
+
+    Recording now copies the original CPU pixels and attached palette instead
+    of reading back the GPU canvas. It recovered complete game frames after
+    the GPU failure; static terrain and HUD regions matched the last valid GPU
+    screenshot pixel-for-pixel. Four successive live captures changed as the
+    game advanced, taking 23–24 ms each, and five capture tests validate PNG
+    integrity, colors, stride, source selection, and bounded input handling.
+    The next full run tests both changes together. Neither aborted recording
+    establishes a combat victory.

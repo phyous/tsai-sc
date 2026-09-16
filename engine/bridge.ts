@@ -1,9 +1,11 @@
 /** Loopback transport for BottleShip's supported game automation harness. */
 import { connect, pageEval } from '../.runtime/bottleship/tools/cdp-core';
+import { CpuCapture } from './cpu-capture';
 
 const port = Number(process.env.TSAI_BRIDGE_PORT || 3917);
 const cdpPort = Number(process.env.TSAI_CDP_PORT || 9333);
 let session: any;
+const cpuCapture = new CpuCapture();
 async function connected() {
   if (!session) session = (await connect({port:cdpPort})).session;
   return session;
@@ -31,6 +33,7 @@ Bun.serve({
       if (req.method === 'GET' && url.pathname === '/health') return json(await rpc('ping'));
       if (req.method === 'POST' && url.pathname === '/boot') {
         const s = await connected();
+        cpuCapture.reset();
         await s.send('Page.reload',{ignoreCache:true});
         await Bun.sleep(500); // Allow the old execution context to be destroyed.
         let mounted = false;
@@ -50,12 +53,9 @@ Bun.serve({
         return json(await rpc('readBytes',[addr,len]));
       }
       if (req.method === 'GET' && url.pathname === '/screenshot') {
-        const s = await connected();
-        // Match BottleShip gridShot's canvas clipping: the paused DDraw presenter
-        // can return a black worker-side capture despite a valid composed frame.
-        const clip = await pageEval(s, `(() => { const c = document.querySelector('canvas'); if (!c) throw Error('No game canvas'); const r = c.getBoundingClientRect(); return {x:r.x,y:r.y,width:r.width,height:r.height,scale:1}; })()`);
-        const shot = await s.send('Page.captureScreenshot',{format:'png',clip});
-        return new Response(Buffer.from(shot.result.data,'base64'), {headers:{'Content-Type':'image/png','Cache-Control':'no-store'}});
+        const png = await cpuCapture.capture(await connected());
+        return new Response(png, {headers:{'Content-Type':'image/png','Cache-Control':'no-store',
+          'X-TSAI-Capture':'ddraw-cpu-palette8'}});
       }
       if (req.method === 'POST' && url.pathname === '/rpc') {
         const {cmd,args=[]} = await req.json() as {cmd:string,args:unknown[]};
@@ -70,7 +70,7 @@ Bun.serve({
       return json({error:'Not found'},404);
     } catch(e) {
       if (e instanceof BadRequest || e instanceof SyntaxError) return json({error:'Invalid game harness request'},400);
-      session?.close(); session=undefined;
+      session?.close(); session=undefined; cpuCapture.reset();
       return json({error:'Game harness request failed'},500);
     }
   }

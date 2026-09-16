@@ -12,7 +12,18 @@ if [ ! -d .runtime/bottleship/.git ]; then
 fi
 git -C .runtime/bottleship checkout "$RUNTIME_COMMIT"
 git -C .runtime/bottleship submodule update --init --recursive
+for runtime_patch in "$PWD"/engine/patches/*.patch; do
+  if git -C .runtime/bottleship apply --check "$runtime_patch" 2>/dev/null; then
+    git -C .runtime/bottleship apply "$runtime_patch"
+  elif git -C .runtime/bottleship apply --reverse --check "$runtime_patch" 2>/dev/null; then
+    echo "Runtime patch already applied: $(basename "$runtime_patch")"
+  else
+    echo "Runtime patch does not match the pinned source: $runtime_patch" >&2
+    exit 1
+  fi
+done
 (cd .runtime/bottleship && bun install --frozen-lockfile)
+(cd .runtime/bottleship && bun test tools/tests/ddraw-present-buffer-lifetime.test.ts)
 if [ ! -f .runtime/bottleship/public/starcraft_demo.wgb ]; then
   curl --fail --location https://bottleship.pages.dev/apps/starcraft_demo.wgb -o .runtime/bottleship/public/starcraft_demo.wgb
 fi

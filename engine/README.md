@@ -78,15 +78,26 @@ The persistent Bun bridge binds to `127.0.0.1:3917`. Routes: `GET /health`,
 `{"cmd":"key","args":["b"]}`, and `POST /step` with `{"frames":24}`.
 Memory reads are limited to 64 KiB per RPC; the Python client chunks larger reads.
 The bridge permits an explicit set of game harness commands, rejects browser
-Origin requests, and contains no model/API credentials. Screenshots use the same
-canvas clipping approach as BottleShip's screenshot harness because its paused
-DDraw presenter may return black frames through the worker capture method.
+Origin requests, and contains no model/API credentials. Screenshots copy the
+original 640×480 DirectDraw CPU surface and its attached 256-color palette in one
+synchronous, read-only worker snapshot. The bridge encodes those original pixels
+as PNG without GPU readback. It requires an unambiguous 8-bit CPU surface and
+fails if that source is unavailable. No arbitrary evaluation or framebuffer
+address is accepted from a caller. See [capture implementation](cpu-capture.ts).
+
+Setup also applies the checked-in [renderer patch](patches/) to the pinned
+BottleShip revision. StarCraft's CPU-drawn frames create temporary palette-upload
+buffers in the GPU presenter; the patch releases them after the frame's command
+encoders have been submitted. Earlier unpatched runs exhausted paging space and
+lost the Chrome GPU process. CPU recording and GPU buffer cleanup address the
+capture dependency and allocation lifetime separately.
 
 ## Verification
 
 ```sh
 python -m unittest discover -s tests -p test_engine.py -v
 python -m unittest discover -s tests -p test_boot.py -v
+bun test engine/cpu-capture.test.ts
 TSAI_TEST_BRIDGE_URL=http://127.0.0.1:3917 python -m unittest discover -s tests -p test_bridge_protocol.py -v
 ```
 
