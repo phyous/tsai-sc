@@ -77,6 +77,13 @@ def observation_pacing(state, after=None, *, decision_seconds, combat_decision_s
             'after_frame': after.get('frame') if after else None}
 
 
+def lane_pacing(pacing, lane):
+    if lane == 'economy':
+        return {**pacing, 'seconds': 0, 'reason': 'army_decision_follows_without_an_extra_wait',
+                'scheduled_interval_without_lane_override': pacing['seconds']}
+    return pacing
+
+
 class Recorder:
     def __init__(self, bridge, directory, fps=8):
         self.bridge = bridge
@@ -134,7 +141,7 @@ class Recorder:
 
 
 def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decision_seconds=2,
-        combat_decision_seconds=None, capture_fps=8):
+        combat_decision_seconds=None, capture_fps=8, separate_economy=False):
     validate_pacing(decision_seconds, combat_decision_seconds)
     bridge = BottleShipBridge()
     bridge.pause()
@@ -150,6 +157,8 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
     model_calls = 0
     final = None
     last_observed_frame = None
+    next_lane = 'economy'
+    unchanged_frame_expected = False
     write_json(recorder.directory / 'manifest.json', {
         'started_utc': datetime.now(timezone.utc).isoformat(), 'mission': initial['mission'],
         'game': 'Original StarCraft Shareware(ED) v4.00 executable on BottleShip',
@@ -161,6 +170,9 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
         'max_requests': max_requests, 'max_seconds': max_seconds, 'capture_fps': capture_fps,
         'decision_seconds': decision_seconds,
         'combat_decision_seconds': combat_decision_seconds,
+        'separate_economy': separate_economy,
+        'decision_schedule': ('Alternate Economy and Army decision opportunities, each based on a fresh paused observation and each permitting no command. Each opportunity with multiple candidates uses a separate API request; a sole Continue candidate needs no request. No additional wait after Economy; the configured interval follows Army.'
+                              if separate_economy else 'One joint command graph per observation.'),
         'combat_pacing_rule': 'When enabled, use the combat interval for one wait after a visible hostile was within 512px of a living completed owned combat unit in the pre-command or post-command observation; otherwise use the baseline. Selection time is additional.',
         'source_sha256': {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                           for path in sorted(Path(__file__).parent.glob('*.py'))},
@@ -194,7 +206,8 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
                     recorder.action = {'label': 'Original game engine reports ' + state['status']}
                     recorder.frame(force=True, status=state['status'])
                     break
-                stopped_clock = state['frame'] == last_observed_frame
+                stopped_clock = state['frame'] == last_observed_frame and not unchanged_frame_expected
+                unchanged_frame_expected = False
                 last_observed_frame = state['frame']
                 if state.get('game_paused') or stopped_clock:
                     # Original campaign transmissions can pause simulation and
@@ -209,12 +222,17 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
                     bridge.pause()
                     continue
                 is_combat = state.get('mission_kind') == 'combat'
+                lane = next_lane if is_combat and separate_economy else None
                 pacing = observation_pacing(state, decision_seconds=decision_seconds,
                                             combat_decision_seconds=combat_decision_seconds)
-                actions = combat.candidates(state, combat.STRONGARM, history) if is_combat else candidates(state)
+                pacing = lane_pacing(pacing, lane)
+                actions = (combat.lane_candidates(state, lane, mission=combat.STRONGARM, history=history) if lane else
+                           combat.candidates(state, combat.STRONGARM, history) if is_combat else candidates(state))
                 if len(actions) > 1:
                     routing = None
-                    if is_combat:
+                    if lane:
+                        model_state, questions, routing = combat.lane_graph_request_for(state, actions, lane, history, combat.STRONGARM)
+                    elif is_combat:
                         model_state, questions, routing = combat.graph_request_for(state, actions, history, combat.STRONGARM)
                     else:
                         model_state, questions = request_for(state, actions, history)
@@ -223,6 +241,8 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
                     response = client.evaluate(model_state, questions)
                     response_received_t = time.monotonic() - start
                     response['metadata']['observed_frame'] = state['frame']
+                    if lane:
+                        response['metadata']['control_lane'] = lane
                     choice, child_question = (combat.resolve_graph_choice(response, routing) if routing else
                                               (response['answers']['action']['choice'], 'action'))
                     if routing:
@@ -244,6 +264,7 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
                     after_observed_t = time.monotonic() - start
                     pacing = observation_pacing(state, after, decision_seconds=decision_seconds,
                                                 combat_decision_seconds=combat_decision_seconds)
+                    pacing = lane_pacing(pacing, lane)
                     executed = ({**selected, 'units': issued['selected_units']} if 'selected_units' in issued else selected)
                     verified = (verify_command(state, after, executed) if issued.get('issued') else
                                 {'accepted': False, 'evidence': issued.get('reason', 'Input was not issued')})
@@ -269,6 +290,8 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
                                        'workers': [u for u in after['units'] if u['type_id'] == 7 and u['owner'] == after['player_id']]}}
                     if routing:
                         event['routing'] = routing
+                    if lane:
+                        event['control_lane'] = lane
                     decisions.write(json.dumps(event, separators=(',', ':')) + '\n')
                     decisions.flush()
                     history.append({'command': selected['label'], 'kind': selected['kind'], 'squad': selected.get('squad'), 'point': selected.get('point'),
@@ -288,10 +311,11 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
                         probability_text = f'intent={intent["choice"]} intent_probability={intent["probabilities"][intent["choice"]]:.3f} branch_probability={probability}'
                     else:
                         probability_text = f'probability={response["answers"]["action"]["probabilities"][choice]:.3f}'
-                    print(f'call={model_calls} frame={state["frame"]} minerals={state["minerals"]} gas={state["gas"]} choice={choice} {probability_text}', flush=True)
+                    print(f'call={model_calls} frame={state["frame"]} lane={lane or "joint"} minerals={state["minerals"]} gas={state["gas"]} choice={choice} {probability_text}', flush=True)
                 else:
                     recorder.action = {'label': 'Current orders continue; no new command available'}
-                bridge.resume()
+                if pacing['seconds'] > 0:
+                    bridge.resume()
                 wait_started = time.monotonic()
                 deadline = wait_started + pacing['seconds']
                 recorder.pacing = {**pacing, 'phase': 'between_decisions',
@@ -301,6 +325,11 @@ def run(directory, *, env_file=None, max_requests=400, max_seconds=1200, decisio
                     recorder.frame()
                     time.sleep(.04)
                 bridge.pause()
+                if lane:
+                    next_lane = 'army' if lane == 'economy' else 'economy'
+                    # A no-op Economy decision can legitimately leave the same
+                    # original frame for Army; this is not a mission pause.
+                    unchanged_frame_expected = lane == 'economy'
         if final is None:
             raise RuntimeError('Run reached its time limit without an engine-confirmed victory')
         write_json(recorder.directory / 'result.json', {
@@ -343,6 +372,8 @@ def main():
     parser.add_argument('--combat-decision-seconds', type=float, default=None,
                         help='Optional shorter wait after observed nearby combat (0.2–10 seconds, at most --decision-seconds)')
     parser.add_argument('--capture-fps', type=int, default=8)
+    parser.add_argument('--separate-economy', action='store_true',
+                        help='Alternate separate model decisions for economy and army in combat missions')
     args = parser.parse_args()
     if not (1 <= args.max_requests <= 2000 and 1 <= args.max_seconds <= 3600 and .2 <= args.decision_seconds <= 10 and 1 <= args.capture_fps <= 30):
         parser.error('Requested limits are outside the supported range')
@@ -352,7 +383,7 @@ def main():
         parser.error(str(error))
     result = run(args.run_dir, env_file=args.env_file, max_requests=args.max_requests, max_seconds=args.max_seconds,
                  decision_seconds=args.decision_seconds, combat_decision_seconds=args.combat_decision_seconds,
-                 capture_fps=args.capture_fps)
+                 capture_fps=args.capture_fps, separate_economy=args.separate_economy)
     raise SystemExit(0 if result == 'victory' else 2)
 
 

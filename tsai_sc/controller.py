@@ -285,6 +285,29 @@ class InputAdapter:
             raise RuntimeError('Original game input was rejected by the runtime')
         return result
 
+    def _await_selection(self, expected):
+        """Wait for one queued selection input, without issuing another click.
+
+        Short running intervals let the original message loop acknowledge the
+        mouse-up. Readback and recording happen paused, so capture work cannot
+        add unbounded simulation time to a selection click.
+        """
+        actual = []
+        elapsed = 0.0
+        for polls, seconds in enumerate((.02, .04, .04, .04, .04, .04), 1):
+            self.bridge.resume()
+            try:
+                time.sleep(seconds)
+            finally:
+                self.bridge.pause()
+            elapsed += seconds
+            if self.on_frame:
+                self.on_frame()
+            actual = read_selection(self.bridge.read_memory)
+            if set(actual) == set(expected):
+                break
+        return actual, {'polls': polls, 'running_wait_seconds': round(elapsed, 3)}
+
     def camera(self):
         x, y = struct.unpack('<II', self.bridge.read_memory(CAMERA, 8))
         return {'x': x, 'y': y}
@@ -333,6 +356,7 @@ class InputAdapter:
         def available_units(snapshot):
             return {u['id']: u for u in snapshot['units'] if u['id'] in requested
                     and u['owner'] == state['player_id'] and u['completed'] and u['visible']
+                    and u.get('hp', 0) > 0
                     and (expected_generations[u['id']] is None or u.get('generation') == expected_generations[u['id']])}
 
         def finish(actual, available, method, checks):
@@ -366,6 +390,7 @@ class InputAdapter:
                 if unit_id in actual and set(actual).issubset(requested):
                     continue
                 extend = bool(actual) and set(actual).issubset(requested)
+                expected_selection = set(actual) | {unit_id} if extend else {unit_id}
                 if extend:
                     self._queue_input('key', 'shift', {'down': True})
                 try:
@@ -385,14 +410,14 @@ class InputAdapter:
                                           min(638, point['x'] + 4), min(310, point['y'] + 4), 0)
                     else:
                         self._queue_input('clickHold', point['x'], point['y'], 1, 0)
-                    self.bridge.resume()
-                    self._settle()
+                    actual, acknowledgment = self._await_selection(expected_selection)
                 finally:
                     self.bridge.pause()
                     if extend:
                         self._queue_input('key', 'shift', {'up': True})
                 actual = read_selection(self.bridge.read_memory)
-                checks.append({'clicked_unit': unit_id, 'method': method, 'selected_units': list(actual)})
+                checks.append({'clicked_unit': unit_id, 'method': method, 'selected_units': list(actual),
+                               **acknowledgment})
                 if method == 'click' and unit_id not in actual:
                     missed_clicks.add(unit_id)
                 if not set(actual).issubset(requested):
@@ -420,15 +445,54 @@ class InputAdapter:
         self.bridge.resume()
         target = action['point']
         if action['kind'] == 'attack_target':
+            original = next((u for u in state['units'] if u['id'] == action['target']), None)
+            generation = action.get('target_generation', original.get('generation') if original else None)
+
+            def current_enemy(snapshot):
+                return next((u for u in snapshot['units'] if u['id'] == action['target'] and u['visible']
+                             and u['owner'] in snapshot.get('enemy_players', [])
+                             and u.get('hp', 0) > 0
+                             and (generation is None or u.get('generation') == generation)), None)
+
             self.bridge.pause()
             fresh = read_state(self.bridge.read_memory)
-            enemy = next((u for u in fresh['units'] if u['id'] == action['target'] and u['visible']
-                          and u['owner'] in fresh.get('enemy_players', [])), None)
+            enemy = current_enemy(fresh)
             self.bridge.resume()
             if enemy:
                 target = {'x': enemy['x'], 'y': enemy['y']}
             else:
                 return {'issued': False, 'inputs': list(self.inputs), 'reason': 'Focus target is no longer visible', 'selected_units': actual}
+            self.focus(**target)
+            # Arm the original attack cursor before taking the final target
+            # snapshot. A moving target must not spend another .2s under A's
+            # ready wait, then another100ms under a held mouse button.
+            armed = True
+            try:
+                self._input('keyHold', 'a', 60)
+                self.bridge.pause()
+                fresh = read_state(self.bridge.read_memory)
+                enemy = current_enemy(fresh)
+                point = game_to_screen(enemy['x'], enemy['y'], fresh['camera'], height=312) if enemy else None
+                if point is None:
+                    return {'issued': False, 'selected_units': actual,
+                            'reason': 'Focus target disappeared or left the viewport after arming attack'}
+                self._queue_input('clickHold', point['x'], point['y'], 1, 0)
+                self.bridge.resume()
+                self._settle()
+                armed = False
+            finally:
+                if armed:
+                    # Escape is scoped to this armed tactical cursor. It must
+                    # never serve as a general economic-selection reset.
+                    self.bridge.resume()
+                    try:
+                        self._input('keyHold', 'escape', 60)
+                    finally:
+                        self.bridge.pause()
+            self._input('move', 320, 280)
+            return {'issued': True, 'inputs': list(self.inputs), 'destination_input': 'viewport',
+                    'focused_target': {'id': enemy['id'], 'generation': enemy.get('generation'),
+                                       'point': {'x': enemy['x'], 'y': enemy['y']}}, **selection}
         # Ground attack commands use the minimap, which avoids hitting a
         # building sprite at the world destination. Explicit focus fire still
         # clicks the refreshed visible target in the main game viewport.
@@ -479,7 +543,8 @@ class InputAdapter:
             self.bridge.pause()
             fresh = read_state(self.bridge.read_memory)
             actor = next((u for u in fresh['units'] if u['id'] == unit['id']), None)
-            if not actor or not actor['visible'] or not actor['completed']:
+            if (not actor or not actor['visible'] or not actor['completed'] or actor['owner'] != state['player_id']
+                    or actor.get('generation') != unit.get('generation')):
                 return {'issued': False, 'inputs': list(self.inputs), 'reason': 'Actor became unavailable'}
             point = game_to_screen(actor['x'], actor['y'], fresh['camera'], height=312)
             if point is None:
@@ -490,11 +555,8 @@ class InputAdapter:
             selection = self.bridge.rpc('clickHold', point['x'], point['y'], 1, 0)
             if isinstance(selection, dict) and selection.get('ok') is False:
                 raise RuntimeError('Original game unit selection was rejected by the runtime')
-            self.bridge.resume()
-            self._settle()
-            self.bridge.pause()
-            selected = read_selection(self.bridge.read_memory)
-            selection_checks = [{'method': 'click', 'selected_units': list(selected)}]
+            selected, acknowledgment = self._await_selection({actor['id']})
+            selection_checks = [{'method': 'click', 'selected_units': list(selected), **acknowledgment}]
             if selected != [actor['id']] and actor['type_id'] == 7:
                 # An SCV can stand behind the roof of its finished building.
                 # Replace the wrong building selection with one tiny ordinary
@@ -507,11 +569,8 @@ class InputAdapter:
                 if point is not None:
                     self._queue_input('drag', max(1, point['x'] - 4), max(1, point['y'] - 4),
                                       min(638, point['x'] + 4), min(310, point['y'] + 4), 0)
-                    self.bridge.resume()
-                    self._settle()
-                    self.bridge.pause()
-                    selected = read_selection(self.bridge.read_memory)
-                    selection_checks.append({'method': 'box_drag', 'selected_units': list(selected)})
+                    selected, acknowledgment = self._await_selection({actor['id']})
+                    selection_checks.append({'method': 'box_drag', 'selected_units': list(selected), **acknowledgment})
             if selected != [actor['id']]:
                 return {'issued': False, 'inputs': list(self.inputs), 'selected_units': selected,
                         'selection_checks': selection_checks,

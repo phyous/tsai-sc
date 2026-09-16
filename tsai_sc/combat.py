@@ -114,6 +114,14 @@ EXPLORATION_GUIDANCE = (
     "These 256px samples do not establish fog coverage, cleared territory, enemy absence, or passability; no path between samples is inferred."
 )
 
+STRATEGIC_GUIDANCE = (
+    "The mission objective is to destroy the rebel base and hostile forces encountered, not to visit every map cell. "
+    "When known_enemy_structures contains observed locations, use an adequately supported force to revisit those locations, deal with armed defenders, and destroy confirmed hostile mission structures. "
+    "A last-seen structure location is a lead to reobserve, not proof that the structure still exists or that its current defenders are known. "
+    "Explore to locate remaining unknown objectives or support necessary transit; sampled-coverage growth must not displace a known mission objective. "
+    "Reinforce or retreat when observed strength is inadequate; all choices remain available to the model."
+)
+
 
 def _endpoint_description(fact):
     if fact["previously_occupied"]:
@@ -749,6 +757,7 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
         key: {"endpoint_visitation": endpoint_fact(visitation, action["point"])}
         for key, action in actions.items() if action["kind"] == CombatKind.EXPLORE.value
     }
+    known_structures = _known_enemy_structures(state, enemies, history)
     model_state = {
         "game": "Original StarCraft shareware combat mission", "mission": mission.name,
         "objectives": list(mission.objectives), "observed_frame": state.get("frame"),
@@ -757,6 +766,13 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
         "recent_battle_outcomes": recent_battle_outcomes(state, history, mission.combat_types),
         "visitation_summary": visitation,
         "exploration_guidance": EXPLORATION_GUIDANCE,
+        "strategic_objective": {
+            "known_structure_locations": len(known_structures),
+            "currently_visible_known_structures": sum(memory["currently_visible"] for memory in known_structures),
+            "known_locations_with_unconfirmed_current_presence": sum(not memory["currently_visible"] for memory in known_structures),
+            "visiting_every_map_cell_is_an_objective": False,
+            "guidance": STRATEGIC_GUIDANCE,
+        },
         "available_command_details": exploration_details,
         "map_pixels": {"width": _bounds(state)[0], "height": _bounds(state)[1]},
         "coordinates": "x increases east; y increases south. Map boundaries are known; unseen enemy locations are not.",
@@ -781,7 +797,7 @@ def request_for(state: dict, actions: dict[str, CombatAction], history: list[dic
         "visible_enemy_count": len(enemies),
         "visible_allies": [_unit_summary(unit, owned=False) for unit in allies[:12]],
         "known_regions": [{"label": region.label, "position": {"x": region.x, "y": region.y}, "source": region.source} for region in mission.known_regions],
-        "known_enemy_structures": _known_enemy_structures(state, enemies, history),
+        "known_enemy_structures": known_structures,
         "observed_friendly_bases": [{"id": unit["id"], "type": unit.get("type"), "position": _point(unit)} for unit in own
                                     if unit["type_id"] in {106, 111, 113} and unit.get("completed") is True and unit.get("visible") is True],
         "recent_model_orders": recent[-8:],
@@ -827,6 +843,10 @@ _INTENT_KINDS = {
     "Reposition": {"retreat", "regroup"},
     "Continue": {"continue"},
 }
+_LANE_KINDS = {
+    "army": frozenset({"attack_target", "attack_move", "explore", "retreat", "regroup", "continue"}),
+    "economy": frozenset({"gather", "train", "build", "upgrade", "continue"}),
+}
 _GRAPH_SEMANTICS = "Independent parallel judgments; intent selects a branch, then its selected concrete command. No joint probability is inferred."
 
 
@@ -870,6 +890,7 @@ def graph_request_for(state: dict, actions: dict[str, CombatAction], history: li
         "criteria": {},
     }}
     questions["intent"]["instructions"] += " " + EXPLORATION_GUIDANCE
+    questions["intent"]["instructions"] += " " + STRATEGIC_GUIDANCE
     routing = graph_routing(actions)
     flat_criteria = flat_questions["action"]["criteria"]
     for category, branch in routing["branches"].items():
@@ -886,6 +907,63 @@ def graph_request_for(state: dict, actions: dict[str, CombatAction], history: li
             }
             if category == "Explore":
                 questions[question_id]["instructions"] += " " + EXPLORATION_GUIDANCE
+            if category in {"Engage", "Explore", "Reposition"}:
+                questions[question_id]["instructions"] += " " + STRATEGIC_GUIDANCE
+    return model_state, questions, routing
+
+
+def lane_candidates(state: dict, lane: str, mission: MissionConfig = STRONGARM,
+                    history: list[dict] | None = None) -> dict[str, CombatAction]:
+    """Filter canonical commands for one separately observed model call.
+
+    Continue remains a real no-op option in either lane. If it is the only
+    command, the runner need not ask the model to choose among identical effects.
+    This helper does not choose, issue, relabel, or invent a command.
+    """
+    if not isinstance(lane, str) or lane not in _LANE_KINDS:
+        raise CombatStateError("Control lane must be army or economy.")
+    return {key: action for key, action in candidates(state, mission, history).items()
+            if action["kind"] in _LANE_KINDS[lane]}
+
+
+def lane_graph_request_for(state: dict, actions: dict[str, CombatAction], lane: str,
+                           history: list[dict] | None = None,
+                           mission: MissionConfig = STRONGARM) -> tuple[dict, dict, dict]:
+    """Keep the original single-action routing contract for an Army/Economy call."""
+    if not isinstance(lane, str) or lane not in _LANE_KINDS:
+        raise CombatStateError("Control lane must be army or economy.")
+    if (not isinstance(actions, dict) or len(actions) < 2
+            or any(not isinstance(action, dict) or action.get("kind") not in _LANE_KINDS[lane]
+                   for action in actions.values())
+            or not any(action.get("kind") == CombatKind.CONTINUE.value for action in actions.values())):
+        raise CombatStateError("A lane graph requires Continue and at least one command from its own lane.")
+    model_state, questions, routing = graph_request_for(state, actions, history, mission)
+    model_state["control_lane"] = lane
+    model_state["control_schedule"] = (
+        "Army and Economy use separate model calls with a fresh observation for each call. "
+        "Each call can authorize at most one command through its intent and selected branch. "
+        "An unselected companion recommendation is never executed. Calls alternate; the configured observation wait follows the Army phase, "
+        "and the Economy phase adds no deliberate observation wait. Ordinary input execution still advances the game. "
+        "Existing orders and production continue until the game finishes them or a later command replaces them."
+    )
+    if lane == "army":
+        instruction = (
+            "This is the Army lane. The separate Economy lane handles workers, buildings, supply, production, and upgrades; "
+            "do not try to select those commands here. Choose only the available military command or Continue. "
+            "Use strategic_objective: once structures have been observed, adequately supported attacks and revisits of those uncertain locations serve the mission; visiting every cell does not. "
+            "Continue is a genuine no-op when preserving current army orders is preferable."
+        )
+    else:
+        instruction = (
+            "This is the Economy lane. The separate Army lane chooses military orders; army movement and fighting continue while an economic command is issued. "
+            "The root intent must choose Economy to issue one worthwhile worker, production, building, supply, or upgrade command, or Continue to issue no economic command. "
+            "Do not choose Continue merely to give the army a turn: the Army lane has its own separate call. "
+            "Consider idle workers and producers, mineral income, replacement capacity, resources, supply, and research. "
+            "Continue is a genuine choice when no offered economic command is useful or a tactical reason justifies avoiding its input time. "
+            "An Economy companion answer is conditional and never authorizes a command unless the root selects Economy."
+        )
+    for question in questions.values():
+        question["instructions"] = instruction + " " + question["instructions"]
     return model_state, questions, routing
 
 

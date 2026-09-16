@@ -10,7 +10,8 @@ from tsai_sc.battle import history_snapshot
 
 from tsai_sc.combat import (
     CombatKind, CombatStateError, KnownRegion, MissionConfig, STRONGARM,
-    candidates, graph_request_for, graph_routing, request_for, resolve_graph_choice,
+    candidates, graph_request_for, graph_routing, lane_candidates, lane_graph_request_for,
+    request_for, resolve_graph_choice,
 )
 
 
@@ -788,6 +789,138 @@ class CombatTests(unittest.TestCase):
         old = next(memory for memory in model["known_enemy_structures"] if "generation" not in memory)
         self.assertFalse(old["currently_visible"])
         self.assertEqual(old["last_seen_frame"], 100)
+
+
+class LaneGraphTests(unittest.TestCase):
+    def setUp(self):
+        self.observed = state()
+        self.observed['gas'] = 100
+        self.observed['units'].extend([
+            unit(20, owner=0, x=560, y=420),
+            unit(30, 111, x=700, y=320, name='Barracks'),
+            unit(31, 176, owner=11, x=250, y=250, hp=100000, name='Mineral Field'),
+            unit(32, 122, x=900, y=320, name='Engineering Bay'),
+        ])
+
+    @staticmethod
+    def response(questions, intent):
+        answers = {}
+        for question_id, question in questions.items():
+            options = list(question['criteria'])
+            answers[question_id] = {
+                'type': 'choice', 'choice': intent if question_id == 'intent' else options[-1],
+                'probabilities': {option: 1 / len(options) for option in options}, 'confidence': 0,
+            }
+        return {'answers': answers}
+
+    def test_lanes_partition_unchanged_canonical_commands_with_continue_in_both(self):
+        all_actions = candidates(self.observed)
+        army = lane_candidates(self.observed, 'army')
+        economy = lane_candidates(self.observed, 'economy')
+        self.assertEqual(set(army) | set(economy), set(all_actions))
+        self.assertEqual(set(army) & set(economy), {'Continue current orders'})
+        for lane in (army, economy):
+            self.assertTrue(all(action == all_actions[key] for key, action in lane.items()))
+            self.assertEqual(lane['Continue current orders']['units'], [])
+        self.assertEqual({action['kind'] for action in economy.values()}, {'continue', 'gather', 'train', 'build', 'upgrade'})
+        self.assertFalse(any(action['kind'] in {'gather', 'train', 'build', 'upgrade'} for action in army.values()))
+
+    def test_lane_graph_keeps_existing_route_and_exact_criteria_contract(self):
+        for lane in ('army', 'economy'):
+            actions = lane_candidates(self.observed, lane)
+            original_model, original_questions, original_routing = graph_request_for(self.observed, actions)
+            model, questions, routing = lane_graph_request_for(self.observed, actions, lane)
+            self.assertEqual(routing, original_routing)
+            self.assertEqual(routing, graph_routing(actions))
+            self.assertEqual(model['control_lane'], lane)
+            self.assertIn('separate model calls', model['control_schedule'])
+            self.assertIn('at most one command', model['control_schedule'])
+            for key, question in questions.items():
+                self.assertEqual(question['criteria'], original_questions[key]['criteria'])
+                self.assertIn('This is the ' + lane.capitalize() + ' lane.', question['instructions'])
+            without_schedule = {key: value for key, value in model.items() if key not in {'control_lane', 'control_schedule'}}
+            self.assertEqual(without_schedule, original_model)
+            self.assertNotIn('control_lane', original_model)
+            if lane == 'economy':
+                self.assertEqual(set(routing['branches']), {'Economy', 'Continue'})
+            else:
+                self.assertNotIn('Economy', routing['branches'])
+
+    def test_economy_companion_does_not_dispatch_when_root_chooses_noop(self):
+        actions = lane_candidates(self.observed, 'economy')
+        _, questions, routing = lane_graph_request_for(self.observed, actions, 'economy')
+        response = self.response(questions, 'Continue')
+        frozen = copy.deepcopy(response)
+        self.assertNotEqual(response['answers']['action_economy']['choice'], 'Continue current orders')
+        self.assertEqual(resolve_graph_choice(response, routing), ('Continue current orders', None))
+        self.assertEqual(response, frozen)
+        response['answers']['intent']['choice'] = 'Economy'
+        selected, child = resolve_graph_choice(response, routing)
+        self.assertEqual(child, 'action_economy')
+        self.assertEqual(selected, response['answers'][child]['choice'])
+        self.assertIn(selected, actions)
+
+    def test_single_available_economy_command_still_requires_root_choice(self):
+        observed = state()
+        observed['minerals'] = 50
+        actions = lane_candidates(observed, 'economy')
+        self.assertEqual(set(actions), {'Continue current orders', 'Train SCV'})
+        _, questions, routing = lane_graph_request_for(observed, actions, 'economy')
+        self.assertEqual(set(questions), {'intent'})
+        self.assertEqual(resolve_graph_choice(self.response(questions, 'Economy'), routing), ('Train SCV', None))
+        self.assertEqual(resolve_graph_choice(self.response(questions, 'Continue'), routing), ('Continue current orders', None))
+
+    def test_only_continue_needs_no_model_graph(self):
+        observed = state()
+        observed['units'] = []
+        observed['minerals'] = 0
+        for lane in ('army', 'economy'):
+            actions = lane_candidates(observed, lane)
+            self.assertEqual(list(actions), ['Continue current orders'])
+            with self.assertRaises(CombatStateError):
+                lane_graph_request_for(observed, actions, lane)
+
+    def test_unknown_lane_cross_lane_commands_and_missing_noop_fail_closed(self):
+        for lane in ('joint', 'Army', None, []):
+            with self.subTest(lane=lane), self.assertRaises(CombatStateError):
+                lane_candidates(self.observed, lane)
+            with self.subTest(lane=lane), self.assertRaises(CombatStateError):
+                lane_graph_request_for(self.observed, {}, lane)
+        for lane in ('army', 'economy'):
+            with self.subTest(lane=lane), self.assertRaises(CombatStateError):
+                lane_graph_request_for(self.observed, candidates(self.observed), lane)
+            actions = lane_candidates(self.observed, lane)
+            actions.pop('Continue current orders')
+            with self.assertRaises(CombatStateError):
+                lane_graph_request_for(self.observed, actions, lane)
+
+    def test_hidden_enemy_changes_neither_lane_actions_nor_requests(self):
+        for lane in ('army', 'economy'):
+            observed = copy.deepcopy(self.observed)
+            actions = lane_candidates(observed, lane)
+            original = lane_graph_request_for(observed, actions, lane)
+            observed['units'].append(unit(900, owner=0, x=2789, y=1837, visible=False))
+            self.assertEqual(lane_candidates(observed, lane), actions)
+            self.assertEqual(lane_graph_request_for(observed, actions, lane), original)
+
+    def test_known_structure_guidance_preserves_uncertainty_without_coverage_goal(self):
+        history = [{'observed_enemy_structures': [
+            {'id': 50, 'type_id': 111, 'type': 'Barracks', 'x': 1500, 'y': 1000, 'last_seen_frame': 200},
+        ]}]
+        observed = copy.deepcopy(self.observed)
+        observed['units'].append(unit(51, 112, owner=0, x=800, y=500, hp=600, name='Academy'))
+        for lane in ('army', 'economy'):
+            actions = lane_candidates(observed, lane, history=history)
+            model, _, _ = lane_graph_request_for(observed, actions, lane, history)
+            strategic = model['strategic_objective']
+            self.assertEqual(strategic['known_structure_locations'], 2)
+            self.assertEqual(strategic['currently_visible_known_structures'], 1)
+            self.assertEqual(strategic['known_locations_with_unconfirmed_current_presence'], 1)
+            self.assertFalse(strategic['visiting_every_map_cell_is_an_objective'])
+            self.assertIn('not proof that the structure still exists', strategic['guidance'])
+            remembered = next(memory for memory in model['known_enemy_structures'] if memory['id'] == 50)
+            self.assertFalse(remembered['currently_visible'])
+            self.assertFalse(any(action.get('target') == 50 for action in actions.values()))
 
 
 class GraphTests(unittest.TestCase):

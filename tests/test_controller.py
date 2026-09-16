@@ -70,6 +70,49 @@ class Bridge:
         self.calls.append(('pause',))
 
 
+class SelectionAcknowledgmentTests(unittest.TestCase):
+    def test_delayed_acknowledgment_waits_without_repeating_input_or_recording_unpaused(self):
+        bridge = Bridge()
+        captured = []
+        adapter = InputAdapter(bridge, lambda: captured.append(bridge.running))
+        snapshots = iter(([4], [1], [1, 2]))
+        def selected(_):
+            self.assertFalse(bridge.running)
+            return next(snapshots)
+        def running_wait(seconds):
+            self.assertTrue(bridge.running)
+        with patch('tsai_sc.controller.time.sleep', side_effect=running_wait) as sleep, \
+                patch('tsai_sc.controller.read_selection', side_effect=selected):
+            actual, wait = adapter._await_selection({1, 2})
+        self.assertEqual(actual, [1, 2])
+        self.assertEqual(wait, {'polls': 3, 'running_wait_seconds': .1})
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [.02, .04, .04])
+        self.assertEqual(captured, [False] * 3)
+        self.assertFalse(any(call[0] in {'clickHold', 'key', 'drag'} for call in bridge.calls))
+
+    def test_extra_selection_cannot_acknowledge_and_timeout_is_bounded(self):
+        bridge = Bridge()
+        with patch('tsai_sc.controller.time.sleep') as sleep, \
+                patch('tsai_sc.controller.read_selection', return_value=[1, 2, 3]):
+            actual, wait = InputAdapter(bridge)._await_selection({1, 2})
+        self.assertEqual(actual, [1, 2, 3])
+        self.assertEqual(wait, {'polls': 6, 'running_wait_seconds': .22})
+        self.assertAlmostEqual(sum(call.args[0] for call in sleep.call_args_list), .22)
+        self.assertFalse(bridge.running)
+
+    def test_wait_or_capture_exception_leaves_runtime_paused(self):
+        for failure in ('sleep', 'capture'):
+            bridge = Bridge()
+            def capture():
+                self.assertFalse(bridge.running)
+                if failure == 'capture':
+                    raise RuntimeError('capture failed')
+            with patch('tsai_sc.controller.time.sleep', side_effect=RuntimeError('sleep failed') if failure == 'sleep' else None):
+                with self.assertRaisesRegex(RuntimeError, 'failed'):
+                    InputAdapter(bridge, capture)._await_selection({1})
+            self.assertFalse(bridge.running)
+
+
 class ControllerTests(unittest.TestCase):
     def test_supply_accounts_for_queue_and_incomplete_depots(self):
         state = mission()
@@ -760,7 +803,98 @@ class TacticalControllerTests(unittest.TestCase):
         action['target'] = 9
         result, bridge = self.execute(state, action, snapshots=[state] * 4 + [fresh])
         self.assertTrue(result['issued'])
-        self.assertIn(('clickHold', 540, 206, 100, 0), bridge.calls)
+        self.assertIn(('clickHold', 540, 206, 1, 0), bridge.calls)
+
+    def test_focus_refreshes_after_attack_ready_and_queues_target_tap_paused(self):
+        state = self.state()
+        state['units'][-1]['generation'] = 4
+        bridge = Bridge()
+        adapter = InputAdapter(bridge)
+        adapter._settle = lambda *args: None
+        def snapshot(_):
+            self.assertFalse(bridge.running)
+            fresh = copy.deepcopy(state)
+            if ('keyHold', 'a', 60) in bridge.calls:
+                fresh['units'][-1].update(x=540, y=590)
+            return fresh
+        action = {**self.action('attack_target'), 'target': 9}
+        with patch('tsai_sc.controller.read_state', side_effect=snapshot), \
+                patch('tsai_sc.controller.read_selection', return_value=[1, 2]):
+            result = adapter.execute(state, action)
+        self.assertTrue(result['issued'])
+        self.assertIn(('clickHold', 540, 206, 1, 0), bridge.calls)
+        self.assertNotIn(('clickHold', 480, 176, 1, 0), bridge.calls)
+        self.assertIn(('clickHold', False), bridge.input_running)
+        self.assertEqual(result['focused_target'], {'id': 9, 'generation': 4, 'point': {'x': 540, 'y': 590}})
+        self.assertNotIn(('keyHold', 'escape', 60), bridge.calls)
+
+    def test_armed_focus_cancels_if_target_dies_recycles_hides_changes_side_or_leaves_viewport(self):
+        for change in ({'hp': 0}, {'generation': 5}, {'visible': False}, {'owner': 6}, {'x': 800}):
+            with self.subTest(change=change):
+                state = self.state()
+                state['units'][-1]['generation'] = 4
+                bridge = Bridge()
+                adapter = InputAdapter(bridge)
+                adapter._settle = lambda *args: None
+                def snapshot(_):
+                    fresh = copy.deepcopy(state)
+                    if ('keyHold', 'a', 60) in bridge.calls:
+                        fresh['units'][-1].update(change)
+                    return fresh
+                with patch('tsai_sc.controller.read_state', side_effect=snapshot), \
+                        patch('tsai_sc.controller.read_selection', return_value=[1, 2]):
+                    result = adapter.execute(state, {**self.action('attack_target'), 'target': 9})
+                self.assertFalse(result['issued'])
+                self.assertFalse(any(call[0] == 'clickHold' for call in bridge.calls))
+                self.assertIn(('keyHold', 'escape', 60), bridge.calls)
+                self.assertIn({'command': 'keyHold', 'args': ['escape', 60]}, result['inputs'])
+                self.assertFalse(bridge.running)
+
+    def test_surviving_selection_excludes_dead_and_recycled_requested_identities(self):
+        for change in ({'hp': 0}, {'generation': 2}):
+            state = self.state()
+            state['units'][0]['generation'] = state['units'][1]['generation'] = 1
+            fresh = copy.deepcopy(state)
+            fresh['units'][1].update(change)
+            bridge = Bridge()
+            with patch('tsai_sc.controller.read_state', return_value=fresh), \
+                    patch('tsai_sc.controller.read_selection', return_value=[1]):
+                result = InputAdapter(bridge)._select_squad(state, self.action())
+            self.assertEqual(result['selected_units'], [1])
+            self.assertEqual(result['available_requested_units'], [1])
+            self.assertEqual(result['selected_unit_generations'], {'1': 1})
+            self.assertFalse(any(call[0] == 'clickHold' for call in bridge.calls))
+
+    def test_selection_acknowledgment_error_still_releases_shift(self):
+        state, bridge = self.state(), Bridge()
+        adapter = InputAdapter(bridge)
+        def selection(_):
+            if ('key', 'shift', {'down': True}) in bridge.calls:
+                raise RuntimeError('selection read failed')
+            return [1] if any(call[0] == 'clickHold' for call in bridge.calls) else []
+        with patch('tsai_sc.controller.time.sleep'), \
+                patch('tsai_sc.controller.read_state', return_value=state), \
+                patch('tsai_sc.controller.read_selection', side_effect=selection):
+            with self.assertRaisesRegex(RuntimeError, 'selection read failed'):
+                adapter.execute(state, self.action())
+        down = bridge.calls.index(('key', 'shift', {'down': True}))
+        self.assertIn(('key', 'shift', {'up': True}), bridge.calls[down + 1:])
+        self.assertFalse(bridge.running)
+
+    def test_focus_read_error_cancels_armed_cursor_and_pauses(self):
+        state, bridge = self.state(), Bridge()
+        adapter = InputAdapter(bridge)
+        adapter._settle = lambda *args: None
+        def snapshot(_):
+            if ('keyHold', 'a', 60) in bridge.calls:
+                raise RuntimeError('focus read failed')
+            return state
+        with patch('tsai_sc.controller.read_state', side_effect=snapshot), \
+                patch('tsai_sc.controller.read_selection', return_value=[1, 2]):
+            with self.assertRaisesRegex(RuntimeError, 'focus read failed'):
+                adapter.execute(state, {**self.action('attack_target'), 'target': 9})
+        self.assertIn(('keyHold', 'escape', 60), bridge.calls)
+        self.assertFalse(bridge.running)
 
     def test_strongarm_minimap_uses_centered_one_pixel_per_tile_geometry(self):
         bridge = Bridge(camera=(0, 0))

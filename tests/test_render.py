@@ -91,6 +91,28 @@ class GraphOverlayTests(unittest.TestCase):
         self.assertIn('TEST: scout east', labels)
         self.assertEqual(item, original)
 
+    def test_control_lane_adds_only_its_caption_without_changing_graph_or_probabilities(self):
+        for lane, caption, item in (("army", "Army decision", graph_record()),
+                                    ("economy", "Economy decision", record())):
+            with self.subTest(lane=lane):
+                baseline_labels = self.draw_labels(item)
+                item['decision']['metadata']['control_lane'] = lane
+                original = copy.deepcopy(item)
+                labels = self.draw_labels(item)
+                self.assertEqual(labels.count(caption), 1)
+                self.assertEqual([label for label in labels if label != caption], baseline_labels)
+                self.assertEqual(item, original)
+
+    def test_joint_records_have_no_lane_caption_and_unknown_lanes_fail(self):
+        labels = self.draw_labels(graph_record())
+        self.assertNotIn('Army decision', labels)
+        self.assertNotIn('Economy decision', labels)
+        for invalid in ('joint', 'unknown', 1, ['army']):
+            item = graph_record()
+            item['decision']['metadata']['control_lane'] = invalid
+            with self.subTest(lane=invalid), self.assertRaises(RenderError):
+                self.draw_labels(item)
+
     def test_unselected_branch_is_retained_but_not_displayed_as_an_order(self):
         item = graph_record()
         labels = self.draw_labels(item)

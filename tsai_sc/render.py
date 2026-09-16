@@ -273,6 +273,9 @@ def compose_frame(record: dict, game: Image.Image, *, speed: float = 4, test_onl
     metadata = decision.get("metadata") or {}
     if not isinstance(metadata, dict):
         raise RenderError("Recorded decision metadata must be an object.")
+    control_lane = metadata.get("control_lane")
+    if control_lane is not None and control_lane not in ("army", "economy"):
+        raise RenderError("Recorded control lane must be army or economy.")
     all_groups = groups
     graph = metadata.get('decision_graph')
     if graph is not None:
@@ -328,6 +331,8 @@ def compose_frame(record: dict, game: Image.Image, *, speed: float = 4, test_onl
         _text(draw, (x, 154), value, 25, TEXT, True)
     draw.line((1048, 199, 1544, 199), fill=BORDER, width=1)
     _text(draw, (1048, 218), "ACTION PROBABILITIES", 15, GREEN, True)
+    if control_lane is not None:
+        _text(draw, (1380, 218), {"army": "Army decision", "economy": "Economy decision"}[control_lane], 14, GOLD)
     observed_frame = metadata.get('observed_frame', state.get("frame"))
     frame_text = str(observed_frame) if type(observed_frame) is int and observed_frame >= 0 else "—"
     decision_caption = (f"Last Jev decision · evaluated frame {frame_text}" if 'observed_frame' in metadata else
